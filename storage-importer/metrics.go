@@ -30,7 +30,6 @@ type Metrics struct {
 
 	dbJobsTotal   prometheus.Gauge
 	dbJobsDone    prometheus.Gauge
-	dbJobsPending prometheus.Gauge
 	dbJobsRunning prometheus.Gauge
 	dbJobsFailed  prometheus.Gauge
 }
@@ -89,7 +88,6 @@ func NewMetrics() *Metrics {
 		}),
 		dbJobsTotal:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_total", Help: "Total jobs in DB"}),
 		dbJobsDone:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_done", Help: "Done jobs in DB"}),
-		dbJobsPending: prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_pending", Help: "Pending jobs in DB"}),
 		dbJobsRunning: prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_running", Help: "Running jobs in DB"}),
 		dbJobsFailed:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_failed", Help: "Failed jobs in DB"}),
 	}
@@ -100,7 +98,7 @@ func NewMetrics() *Metrics {
 		m.bytesTotal, m.objectsTotal,
 		m.curSegTotal, m.curSegDone,
 		m.lastSuccessTs,
-		m.dbJobsTotal, m.dbJobsDone, m.dbJobsPending, m.dbJobsRunning, m.dbJobsFailed,
+		m.dbJobsTotal, m.dbJobsDone, m.dbJobsRunning, m.dbJobsFailed,
 	)
 	return m
 }
