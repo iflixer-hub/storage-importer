@@ -27,6 +27,12 @@ type Metrics struct {
 	curSegDone  prometheus.Gauge
 
 	lastSuccessTs prometheus.Gauge
+
+	dbJobsTotal   prometheus.Gauge
+	dbJobsDone    prometheus.Gauge
+	dbJobsPending prometheus.Gauge
+	dbJobsRunning prometheus.Gauge
+	dbJobsFailed  prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -81,6 +87,11 @@ func NewMetrics() *Metrics {
 			Name: "import_last_success_timestamp_seconds",
 			Help: "Unix timestamp of last successful job",
 		}),
+		dbJobsTotal:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_total", Help: "Total jobs in DB"}),
+		dbJobsDone:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_done", Help: "Done jobs in DB"}),
+		dbJobsPending: prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_pending", Help: "Pending jobs in DB"}),
+		dbJobsRunning: prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_running", Help: "Running jobs in DB"}),
+		dbJobsFailed:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "db_jobs_failed", Help: "Failed jobs in DB"}),
 	}
 
 	prometheus.MustRegister(
@@ -88,6 +99,8 @@ func NewMetrics() *Metrics {
 		m.httpTotal, m.httpDuration,
 		m.bytesTotal, m.objectsTotal,
 		m.curSegTotal, m.curSegDone,
+		m.lastSuccessTs,
+		m.dbJobsTotal, m.dbJobsDone, m.dbJobsPending, m.dbJobsRunning, m.dbJobsFailed,
 	)
 	return m
 }

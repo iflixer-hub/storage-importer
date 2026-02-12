@@ -76,6 +76,8 @@ func main() {
 	metrics := NewMetrics()
 	app.metrics = metrics
 
+	startDBStatsLoop(context.Background(), db, metrics, 30*time.Second)
+
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
 	log.Printf("start: workers=%d clearFiles=%v bucket=%s endpoint=%s", workers, clearFiles, bucket, endpoint)
