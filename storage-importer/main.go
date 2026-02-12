@@ -76,7 +76,7 @@ func main() {
 	metrics := NewMetrics()
 	app.metrics = metrics
 
-	startDBStatsLoop(context.Background(), db, metrics, 30*time.Second)
+	go startDBStatsLoop(context.Background(), db, metrics, 30*time.Second)
 
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
