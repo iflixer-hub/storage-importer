@@ -288,6 +288,7 @@ func (a *App) worker(ctx context.Context, idx int) {
 			log.Printf("[w%d] job file_id=%d FAILED: %v", idx, job.FileID, err)
 			_ = a.markFailed(ctx, job.FileID, err)
 		} else {
+			a.metrics.lastSuccessTs.Set(float64(time.Now().Unix()))
 			a.metrics.jobsTotal.WithLabelValues("done").Inc()
 			a.metrics.jobDuration.WithLabelValues("done").Observe(time.Since(start).Seconds())
 			log.Printf("[w%d] job file_id=%d DONE", idx, job.FileID)
@@ -295,7 +296,6 @@ func (a *App) worker(ctx context.Context, idx int) {
 			if a.clearFiles {
 				_ = a.clearFilesPath(ctx, job.FileID)
 			}
-			a.metrics.lastSuccessTs.Set(float64(time.Now().Unix()))
 		}
 		a.metrics.inflightJobs.Dec()
 	}
