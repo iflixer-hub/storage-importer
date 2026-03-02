@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -31,7 +34,10 @@ func main() {
 	bucket := mustEnv("R2_BUCKET")
 	endpoint := mustEnv("R2_ENDPOINT")
 	ak := mustEnv("R2_ACCESS_KEY")
-	sk := mustEnv("R2_SECRET_ACCESS_KEY")
+	skFile := mustEnv("R2_SECRET_ACCESS_KEY_FILE")
+	sk, err := os.ReadFile(skFile)
+	must(err)
+	skStr := strings.TrimSpace(string(sk))
 
 	workers := envInt("WORKERS", 1)
 	clearFiles := envBool("CLEAR_FILES_PATH", false)
@@ -44,6 +50,8 @@ func main() {
 	httpClient := &http.Client{
 		Timeout: 120 * time.Second,
 		Transport: &http.Transport{
+			ForceAttemptHTTP2:   false,
+			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 200,
 			IdleConnTimeout:     90 * time.Second,
@@ -53,7 +61,7 @@ func main() {
 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion("auto"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, sk, "")),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, skStr, "")),
 	)
 	must(err)
 
