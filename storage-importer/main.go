@@ -32,6 +32,7 @@ func main() {
 
 	dsn := mustEnv("MYSQL_DSN")
 	bucket := mustEnv("R2_BUCKET")
+	region := mustEnv("R2_REGION")
 	endpoint := mustEnv("R2_ENDPOINT")
 	ak := mustEnv("R2_ACCESS_KEY")
 	skFile := mustEnv("R2_SECRET_ACCESS_KEY_FILE")
@@ -60,7 +61,7 @@ func main() {
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion("auto"),
+		config.WithRegion(region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, skStr, "")),
 	)
 	must(err)
