@@ -132,13 +132,13 @@ func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, 
 }
 
 func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
-	exists, err := a.headObject(ctx, dstKey)
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
+	// exists, err := a.headObject(ctx, dstKey)
+	// if err != nil {
+	// 	return err
+	// }
+	// if exists {
+	// 	return nil
+	// }
 
 	t0 := time.Now()
 	kind := classifyKind(srcURL) // "segment" / "other"
