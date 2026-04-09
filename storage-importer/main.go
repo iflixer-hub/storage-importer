@@ -6,8 +6,6 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
-	"os"
-	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -35,10 +33,11 @@ func main() {
 	region := mustEnv("R2_REGION")
 	endpoint := mustEnv("R2_ENDPOINT")
 	ak := mustEnv("R2_ACCESS_KEY")
-	skFile := mustEnv("R2_SECRET_ACCESS_KEY_FILE")
-	sk, err := os.ReadFile(skFile)
-	must(err)
-	skStr := strings.TrimSpace(string(sk))
+	// skFile := mustEnv("R2_SECRET_ACCESS_KEY_FILE")
+	// sk, err := os.ReadFile(skFile)
+	// must(err)
+	// skStr := strings.TrimSpace(string(sk))
+	skStr := mustEnv("R2_SECRET_ACCESS_KEY")
 
 	workers := envInt("WORKERS", 1)
 	clearFiles := envBool("CLEAR_FILES_PATH", false)
