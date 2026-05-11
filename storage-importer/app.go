@@ -30,6 +30,38 @@ type App struct {
 	metrics    *Metrics
 }
 
+func compactSQL(query string) string {
+	return strings.Join(strings.Fields(query), " ")
+}
+
+func formatSQLArgs(args ...any) string {
+	if len(args) == 0 {
+		return "[]"
+	}
+
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		part := fmt.Sprintf("%v", arg)
+		parts = append(parts, truncate(part, 256))
+	}
+
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func logSQLStart(op, query string, args ...any) time.Time {
+	log.Printf("[mysql] %s start sql=%q args=%s", op, compactSQL(query), formatSQLArgs(args...))
+	return time.Now()
+}
+
+func logSQLFinish(op string, started time.Time, err error) {
+	if err != nil {
+		log.Printf("[mysql] %s error duration=%s err=%v", op, time.Since(started).Round(time.Millisecond), err)
+		return
+	}
+
+	log.Printf("[mysql] %s ok duration=%s", op, time.Since(started).Round(time.Millisecond))
+}
+
 /* -------------------- rewrite + download/upload -------------------- */
 
 func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL string, media Media) (Media, error) {
@@ -196,23 +228,32 @@ func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
 /* -------------------- DB status helpers -------------------- */
 
 func (a *App) markFailed(ctx context.Context, fileID uint64, err error) error {
-	_, e := a.db.ExecContext(ctx, `
+	const q = `
 UPDATE files_storage
 SET status='failed', last_error=?, finished_at=NOW()
-WHERE file_id=?`, truncate(err.Error(), 4000), fileID)
+	WHERE file_id=?`
+	started := logSQLStart("markFailed", q, truncate(err.Error(), 4000), fileID)
+	_, e := a.db.ExecContext(ctx, q, truncate(err.Error(), 4000), fileID)
+	logSQLFinish("markFailed", started, e)
 	return e
 }
 
 func (a *App) markDone(ctx context.Context, fileID uint64) error {
-	_, e := a.db.ExecContext(ctx, `
+	const q = `
 UPDATE files_storage
 SET status='done', finished_at=NOW(), last_error=NULL
-WHERE file_id=?`, fileID)
+	WHERE file_id=?`
+	started := logSQLStart("markDone", q, fileID)
+	_, e := a.db.ExecContext(ctx, q, fileID)
+	logSQLFinish("markDone", started, e)
 	return e
 }
 
 func (a *App) clearFilesPath(ctx context.Context, fileID uint64) error {
-	_, e := a.db.ExecContext(ctx, `UPDATE files SET path='' WHERE id=?`, fileID)
+	const q = `UPDATE files SET path='' WHERE id=?`
+	started := logSQLStart("clearFilesPath", q, fileID)
+	_, e := a.db.ExecContext(ctx, q, fileID)
+	logSQLFinish("clearFilesPath", started, e)
 	return e
 }
 
@@ -224,8 +265,11 @@ func (a *App) saveQualitiesJSON(ctx context.Context, fileID uint64, m Master) er
 	}
 	// без JSON энкодера для краткости:
 	val := `["` + strings.Join(qs, `","`) + `"]`
-	_, _ = a.db.ExecContext(ctx, `UPDATE files_storage SET qualities_json=? WHERE file_id=?`, val, fileID)
-	return nil
+	const q = `UPDATE files_storage SET qualities_json=? WHERE file_id=?`
+	started := logSQLStart("saveQualitiesJSON", q, val, fileID)
+	_, err := a.db.ExecContext(ctx, q, val, fileID)
+	logSQLFinish("saveQualitiesJSON", started, err)
+	return err
 }
 
 /* -------------------- fetch helpers -------------------- */
@@ -264,6 +308,9 @@ func (a *App) fetchText(ctx context.Context, rawURL string) ([]byte, string, err
 }
 
 func (a *App) worker(ctx context.Context, idx int) {
+	log.Printf("[w%d] worker started", idx)
+	lastIdleLog := time.Time{}
+
 	for {
 		job, ok, err := a.claimJob(ctx)
 		if err != nil {
@@ -272,9 +319,14 @@ func (a *App) worker(ctx context.Context, idx int) {
 			continue
 		}
 		if !ok {
+			if time.Since(lastIdleLog) >= 30*time.Second {
+				log.Printf("[w%d] idle: no jobs available", idx)
+				lastIdleLog = time.Now()
+			}
 			time.Sleep(1 * time.Second)
 			continue
 		}
+		lastIdleLog = time.Time{}
 
 		log.Printf("[w%d] job file_id=%d src=%s", idx, job.FileID, job.SourceMaster)
 
@@ -302,7 +354,9 @@ func (a *App) worker(ctx context.Context, idx int) {
 }
 
 func (a *App) claimJob(ctx context.Context) (Job, bool, error) {
+	beginStarted := logSQLStart("claimJob.beginTx", "BEGIN")
 	tx, err := a.db.BeginTx(ctx, &sql.TxOptions{})
+	logSQLFinish("claimJob.beginTx", beginStarted, err)
 	if err != nil {
 		return Job{}, false, err
 	}
@@ -310,17 +364,25 @@ func (a *App) claimJob(ctx context.Context) (Job, bool, error) {
 
 	var j Job
 	var attempts int
-	row := tx.QueryRowContext(ctx, `
+	const claimSelect = `
 SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts
 FROM files_storage
 WHERE status IN ('new','failed')
   AND attempts < 10
 ORDER BY (status='failed'), attempts, file_id
 LIMIT 1
-FOR UPDATE SKIP LOCKED`)
+	FOR UPDATE SKIP LOCKED`
+	selectStarted := logSQLStart("claimJob.select", claimSelect)
+	row := tx.QueryRowContext(ctx, claimSelect)
 	err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts)
+	logSQLFinish("claimJob.select", selectStarted, err)
 	if errors.Is(err, sql.ErrNoRows) {
-		_ = tx.Commit()
+		commitStarted := logSQLStart("claimJob.commit-empty", "COMMIT")
+		commitErr := tx.Commit()
+		logSQLFinish("claimJob.commit-empty", commitStarted, commitErr)
+		if commitErr != nil {
+			return Job{}, false, commitErr
+		}
 		return Job{}, false, nil
 	}
 	if err != nil {
@@ -328,22 +390,30 @@ FOR UPDATE SKIP LOCKED`)
 	}
 	j.AttemptNumber = attempts + 1
 
-	_, err = tx.ExecContext(ctx, `
+	const claimUpdate = `
 UPDATE files_storage
 SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
-WHERE file_id=?`, j.FileID)
+	WHERE file_id=?`
+	updateStarted := logSQLStart("claimJob.update", claimUpdate, j.FileID)
+	_, err = tx.ExecContext(ctx, claimUpdate, j.FileID)
+	logSQLFinish("claimJob.update", updateStarted, err)
 	if err != nil {
 		return Job{}, false, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	commitStarted := logSQLStart("claimJob.commit", "COMMIT", j.FileID)
+	err = tx.Commit()
+	logSQLFinish("claimJob.commit", commitStarted, err)
+	if err != nil {
 		return Job{}, false, err
 	}
 	a.metrics.jobsTotal.WithLabelValues("claimed").Inc()
+	log.Printf("[claim] file_id=%d attempt=%d r2_prefix=%s master_key=%s", j.FileID, j.AttemptNumber, j.R2Prefix, j.R2MasterKey)
 	return j, true, nil
 }
 
 func (a *App) processJob(ctx context.Context, j Job) error {
+	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
 	if err != nil {
 		return fmt.Errorf("fetch master: %w", err)
@@ -366,9 +436,11 @@ func (a *App) processJob(ctx context.Context, j Job) error {
 		return fmt.Errorf("parse master: %w", err)
 	}
 	if len(master.Variants) == 0 {
+		log.Printf("[job %d] master is single media playlist", j.FileID)
 		// Иногда master == media playlist. Тогда считаем это "single quality".
 		return a.processSinglePlaylistAsQuality(ctx, j, masterURL, masterBytes)
 	}
+	log.Printf("[job %d] parsed master variants=%d", j.FileID, len(master.Variants))
 
 	// 1) Сначала обрабатываем каждый variant → сегменты + index.m3u8 в папку качества
 	rewrittenVariants := make([]MasterVariant, 0, len(master.Variants))
@@ -389,6 +461,7 @@ func (a *App) processJob(ctx context.Context, j Job) error {
 		if quality == "" {
 			quality = "q" + shortHash(v.URI)
 		}
+		log.Printf("[job %d] processing quality=%s variant=%s", j.FileID, quality, variantAbs)
 
 		// качаем/заливаем все “ресурсные URI” плейлиста (сегменты, init.mp4, key и т.п.)
 		// и переписываем плейлист на относительные пути с нумерацией ts.
@@ -416,6 +489,7 @@ func (a *App) processJob(ctx context.Context, j Job) error {
 	if err := a.putObjectText(ctx, j.R2MasterKey, masterOut); err != nil {
 		return fmt.Errorf("upload master %s: %w", j.R2MasterKey, err)
 	}
+	log.Printf("[job %d] uploaded master key=%s", j.FileID, j.R2MasterKey)
 
 	// для диагностики можно сохранить qualities_json
 	_ = a.saveQualitiesJSON(ctx, j.FileID, master)
@@ -430,6 +504,7 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		return fmt.Errorf("parse as media: %w", err)
 	}
 	quality := "default"
+	log.Printf("[job %d] processing single playlist quality=%s", j.FileID, quality)
 
 	rewrittenMedia, err := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media)
 	if err != nil {
