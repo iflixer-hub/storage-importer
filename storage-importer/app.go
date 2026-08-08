@@ -61,6 +61,13 @@ func logSQLStart(op, query string, args ...any) time.Time {
 }
 
 func logSQLFinish(op string, started time.Time, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		if debugMySQL {
+			log.Printf("[mysql] %s empty duration=%s", op, time.Since(started).Round(time.Millisecond))
+		}
+		return
+	}
+
 	if err != nil && mysqlLogErrors {
 		log.Printf("[mysql] %s error duration=%s err=%v", op, time.Since(started).Round(time.Millisecond), err)
 		return
