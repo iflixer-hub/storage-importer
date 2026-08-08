@@ -49,11 +49,17 @@ func formatSQLArgs(args ...any) string {
 }
 
 func logSQLStart(op, query string, args ...any) time.Time {
+	if !debugMySQL {
+		return time.Now()
+	}
 	log.Printf("[mysql] %s start sql=%q args=%s", op, compactSQL(query), formatSQLArgs(args...))
 	return time.Now()
 }
 
 func logSQLFinish(op string, started time.Time, err error) {
+	if !debugMySQL {
+		return
+	}
 	if err != nil {
 		log.Printf("[mysql] %s error duration=%s err=%v", op, time.Since(started).Round(time.Millisecond), err)
 		return

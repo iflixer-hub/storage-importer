@@ -36,10 +36,14 @@ SELECT
 FROM files_storage;`
 		var total, done, running, failed sql.NullInt64
 		if err := db.QueryRowContext(ctx, q).Scan(&total, &done, &running, &failed); err != nil {
-			log.Printf("[mysql] db stats query error: %v", err)
+			if debugMySQL {
+				log.Printf("[mysql] db stats query error: %v", err)
+			}
 			return
 		}
-		log.Printf("[dbstats] total=%d done=%d running=%d failed=%d", total.Int64, done.Int64, running.Int64, failed.Int64)
+		if debugMySQL {
+			log.Printf("[dbstats] total=%d done=%d running=%d failed=%d", total.Int64, done.Int64, running.Int64, failed.Int64)
+		}
 		m.SetDBStats(DBStats{
 			Total:   float64(total.Int64),
 			Done:    float64(done.Int64),

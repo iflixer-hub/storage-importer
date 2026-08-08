@@ -30,6 +30,7 @@ services:
       R2_ENDPOINT: "${R2_ENDPOINT}"
       WORKERS: "1"
       CLEAR_FILES_PATH: "false"
+      DEBUG_MYSQL: "${DEBUG_MYSQL:-false}"
 
     depends_on:
       mysql:
