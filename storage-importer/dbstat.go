@@ -36,7 +36,7 @@ SELECT
 FROM files_storage;`
 		var total, done, running, failed sql.NullInt64
 		if err := db.QueryRowContext(ctx, q).Scan(&total, &done, &running, &failed); err != nil {
-			if debugMySQL {
+			if mysqlLogErrors {
 				log.Printf("[mysql] db stats query error: %v", err)
 			}
 			return

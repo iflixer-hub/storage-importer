@@ -17,7 +17,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-var debugMySQL bool
+var (
+	debugMySQL     bool
+	mysqlLogErrors bool
+)
 
 func main() {
 	// ENV:
@@ -44,6 +47,7 @@ func main() {
 	workers := envInt("WORKERS", 1)
 	clearFiles := envBool("CLEAR_FILES_PATH", false)
 	debugMySQL = envBool("DEBUG_MYSQL", false)
+	mysqlLogErrors = envBool("MYSQL_LOG_ERRORS", true)
 
 	db, err := sql.Open("mysql", dsn)
 	must(err)
@@ -91,7 +95,7 @@ func main() {
 
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
-	log.Printf("start: workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v", workers, clearFiles, bucket, endpoint, debugMySQL)
+	log.Printf("start: workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()
 	for i := range workers {

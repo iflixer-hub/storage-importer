@@ -31,6 +31,7 @@ services:
       WORKERS: "1"
       CLEAR_FILES_PATH: "false"
       DEBUG_MYSQL: "${DEBUG_MYSQL:-false}"
+      MYSQL_LOG_ERRORS: "${MYSQL_LOG_ERRORS:-true}"
 
     depends_on:
       mysql:
