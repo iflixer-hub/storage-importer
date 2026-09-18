@@ -46,6 +46,12 @@ func main() {
 
 	workers := envInt("WORKERS", 1)
 	clearFiles := envBool("CLEAR_FILES_PATH", false)
+	jobHeartbeatInterval := time.Duration(envInt("JOB_HEARTBEAT_SECONDS", 60)) * time.Second
+	jobRecoveryTimeout := time.Duration(envInt("JOB_RECOVERY_TIMEOUT_SECONDS", 600)) * time.Second
+	jobRecoveryInterval := time.Duration(envInt("JOB_RECOVERY_INTERVAL_SECONDS", 60)) * time.Second
+	if jobHeartbeatInterval <= 0 || jobRecoveryInterval <= 0 || jobRecoveryTimeout <= 2*jobHeartbeatInterval {
+		log.Fatal("JOB_RECOVERY_TIMEOUT_SECONDS must exceed twice JOB_HEARTBEAT_SECONDS; all recovery values must be positive")
+	}
 	debugMySQL = envBool("DEBUG_MYSQL", false)
 	mysqlLogErrors = envBool("MYSQL_LOG_ERRORS", true)
 
@@ -57,6 +63,7 @@ func main() {
 	httpClient := &http.Client{
 		Timeout: 120 * time.Second,
 		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
 			ForceAttemptHTTP2:   false,
 			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 			MaxIdleConns:        200,
@@ -65,10 +72,17 @@ func main() {
 			DisableCompression:  false,
 		},
 	}
+	r2Transport := http.DefaultTransport.(*http.Transport).Clone()
+	r2Transport.Proxy = nil
+	r2HTTPClient := &http.Client{
+		Timeout:   120 * time.Second,
+		Transport: r2Transport,
+	}
 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, skStr, "")),
+		config.WithHTTPClient(r2HTTPClient),
 	)
 	must(err)
 
@@ -86,6 +100,10 @@ func main() {
 		bucket:     bucket,
 		clearFiles: clearFiles,
 		workers:    workers,
+
+		jobHeartbeatInterval: jobHeartbeatInterval,
+		jobRecoveryTimeout:   jobRecoveryTimeout,
+		jobRecoveryInterval:  jobRecoveryInterval,
 	}
 
 	metrics := NewMetrics()
@@ -98,6 +116,7 @@ func main() {
 	log.Printf("start: workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()
+	go app.recoveryLoop(ctx)
 	for i := range workers {
 		go app.worker(ctx, i)
 	}

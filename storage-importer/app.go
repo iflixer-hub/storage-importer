@@ -28,6 +28,10 @@ type App struct {
 	clearFiles bool
 	workers    int
 	metrics    *Metrics
+
+	jobHeartbeatInterval time.Duration
+	jobRecoveryTimeout   time.Duration
+	jobRecoveryInterval  time.Duration
 }
 
 type processResult struct {
@@ -256,37 +260,51 @@ func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
 
 /* -------------------- DB status helpers -------------------- */
 
-func (a *App) markFailed(ctx context.Context, fileID uint64, err error) error {
+func (a *App) markFailed(ctx context.Context, job Job, err error) error {
 	const q = `
 UPDATE files_storage
 SET status='failed', last_error=?, finished_at=NOW()
-	WHERE file_id=?`
-	started := logSQLStart("markFailed", q, truncate(err.Error(), 4000), fileID)
-	_, e := a.db.ExecContext(ctx, q, truncate(err.Error(), 4000), fileID)
+	WHERE file_id=? AND status='in_progress' AND attempts=?`
+	started := logSQLStart("markFailed", q, truncate(err.Error(), 4000), job.FileID, job.AttemptNumber)
+	result, e := a.db.ExecContext(ctx, q, truncate(err.Error(), 4000), job.FileID, job.AttemptNumber)
 	logSQLFinish("markFailed", started, e)
-	return e
+	return requireCurrentLease(result, e)
 }
 
-func (a *App) markDone(ctx context.Context, fileID uint64, lastError string) error {
+func (a *App) markDone(ctx context.Context, job Job, lastError string) error {
 	if strings.TrimSpace(lastError) == "" {
 		const q = `
 UPDATE files_storage
 SET status='done', finished_at=NOW(), last_error=NULL
-	WHERE file_id=?`
-		started := logSQLStart("markDone", q, fileID)
-		_, e := a.db.ExecContext(ctx, q, fileID)
+	WHERE file_id=? AND status='in_progress' AND attempts=?`
+		started := logSQLStart("markDone", q, job.FileID, job.AttemptNumber)
+		result, e := a.db.ExecContext(ctx, q, job.FileID, job.AttemptNumber)
 		logSQLFinish("markDone", started, e)
-		return e
+		return requireCurrentLease(result, e)
 	}
 
 	const q = `
 UPDATE files_storage
 SET status='done', finished_at=NOW(), last_error=?
-	WHERE file_id=?`
-	started := logSQLStart("markDone", q, truncate(lastError, 4000), fileID)
-	_, e := a.db.ExecContext(ctx, q, truncate(lastError, 4000), fileID)
+	WHERE file_id=? AND status='in_progress' AND attempts=?`
+	started := logSQLStart("markDone", q, truncate(lastError, 4000), job.FileID, job.AttemptNumber)
+	result, e := a.db.ExecContext(ctx, q, truncate(lastError, 4000), job.FileID, job.AttemptNumber)
 	logSQLFinish("markDone", started, e)
-	return e
+	return requireCurrentLease(result, e)
+}
+
+func requireCurrentLease(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return errors.New("job lease is no longer current")
+	}
+	return nil
 }
 
 func (a *App) clearFilesPath(ctx context.Context, fileID uint64) error {
@@ -373,13 +391,17 @@ func (a *App) worker(ctx context.Context, idx int) {
 		start := time.Now()
 		a.metrics.inflightJobs.Inc()
 
-		result, processErr := a.processJob(ctx, job)
+		jobCtx, stopHeartbeat := a.startJobHeartbeat(ctx, job)
+		result, processErr := a.processJob(jobCtx, job)
+		stopHeartbeat()
 		err = processErr
 		if err != nil {
 			a.metrics.jobsTotal.WithLabelValues("failed").Inc()
 			a.metrics.jobDuration.WithLabelValues("failed").Observe(time.Since(start).Seconds())
 			log.Printf("[w%d] job file_id=%d FAILED: %v", idx, job.FileID, err)
-			_ = a.markFailed(ctx, job.FileID, err)
+			if markErr := a.markFailed(ctx, job, err); markErr != nil {
+				log.Printf("[w%d] job file_id=%d mark failed skipped: %v", idx, job.FileID, markErr)
+			}
 		} else {
 			a.metrics.lastSuccessTs.Set(float64(time.Now().Unix()))
 			a.metrics.jobsTotal.WithLabelValues("done").Inc()
@@ -389,12 +411,88 @@ func (a *App) worker(ctx context.Context, idx int) {
 			} else {
 				log.Printf("[w%d] job file_id=%d DONE", idx, job.FileID)
 			}
-			_ = a.markDone(ctx, job.FileID, result.partialMessage)
-			if a.clearFiles {
+			markErr := a.markDone(ctx, job, result.partialMessage)
+			if markErr != nil {
+				log.Printf("[w%d] job file_id=%d mark done skipped: %v", idx, job.FileID, markErr)
+			}
+			if markErr == nil && a.clearFiles {
 				_ = a.clearFilesPath(ctx, job.FileID)
 			}
 		}
 		a.metrics.inflightJobs.Dec()
+	}
+}
+
+func (a *App) startJobHeartbeat(parent context.Context, job Job) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(a.jobHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				result, err := a.db.ExecContext(ctx, `
+UPDATE files_storage
+SET started_at=NOW()
+WHERE file_id=? AND status='in_progress' AND attempts=?`, job.FileID, job.AttemptNumber)
+				if err != nil {
+					log.Printf("[heartbeat] file_id=%d attempt=%d error: %v", job.FileID, job.AttemptNumber, err)
+					continue
+				}
+				affected, err := result.RowsAffected()
+				if err != nil || affected != 1 {
+					log.Printf("[heartbeat] file_id=%d attempt=%d lease lost", job.FileID, job.AttemptNumber)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-done
+	}
+}
+
+func (a *App) recoverStaleJobs(ctx context.Context) error {
+	result, err := a.db.ExecContext(ctx, `
+UPDATE files_storage
+SET status='failed', finished_at=NOW(), last_error='worker lease expired'
+WHERE status='in_progress'
+  AND started_at < DATE_SUB(NOW(), INTERVAL ? SECOND)`, int64(a.jobRecoveryTimeout/time.Second))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		log.Printf("[recovery] returned stale jobs to queue: %d", affected)
+	}
+	return nil
+}
+
+func (a *App) recoveryLoop(ctx context.Context) {
+	recover := func() {
+		if err := a.recoverStaleJobs(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[recovery] error: %v", err)
+		}
+	}
+	recover()
+	ticker := time.NewTicker(a.jobRecoveryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			recover()
+		}
 	}
 }
 

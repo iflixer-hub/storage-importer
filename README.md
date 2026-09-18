@@ -70,3 +70,22 @@ SELECT * FROM files_storage WHERE status='failed' ORDER BY finished_at DESC LIMI
 UPDATE files_storage
 SET status='new'
 WHERE status='failed' AND attempts < 10;
+
+# Автоматический recovery
+
+Во время обработки сервис обновляет `started_at` задания. Если экземпляр сервиса
+погиб и heartbeat прекратился, другой экземпляр автоматически переводит
+просроченное `in_progress` в `failed`; после этого задание снова доступно через
+`FOR UPDATE SKIP LOCKED`. Номер `attempts` используется как fencing token, поэтому
+старый worker не сможет завершить уже перевыданное задание.
+
+Параметры:
+
+```yaml
+JOB_HEARTBEAT_SECONDS: "60"
+JOB_RECOVERY_TIMEOUT_SECONDS: "600"
+JOB_RECOVERY_INTERVAL_SECONDS: "60"
+```
+
+`JOB_RECOVERY_TIMEOUT_SECONDS` должен быть больше удвоенного heartbeat-интервала.
+После 10 попыток задание остается `failed` и автоматически больше не запускается.
