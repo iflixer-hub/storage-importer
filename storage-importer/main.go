@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -46,6 +47,7 @@ func main() {
 
 	workers := envInt("WORKERS", 1)
 	clearFiles := envBool("CLEAR_FILES_PATH", false)
+	allowedQualities := parseQualityList(os.Getenv("ALLOWED_QUALITIES"))
 	jobHeartbeatInterval := time.Duration(envInt("JOB_HEARTBEAT_SECONDS", 60)) * time.Second
 	jobRecoveryTimeout := time.Duration(envInt("JOB_RECOVERY_TIMEOUT_SECONDS", 600)) * time.Second
 	jobRecoveryInterval := time.Duration(envInt("JOB_RECOVERY_INTERVAL_SECONDS", 60)) * time.Second
@@ -99,7 +101,9 @@ func main() {
 
 		bucket:     bucket,
 		clearFiles: clearFiles,
-		workers:    workers,
+
+		allowedQualities: allowedQualities,
+		workers:          workers,
 
 		jobHeartbeatInterval: jobHeartbeatInterval,
 		jobRecoveryTimeout:   jobRecoveryTimeout,
@@ -113,7 +117,7 @@ func main() {
 
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
-	log.Printf("start: workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
+	log.Printf("start: allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()
 	go app.recoveryLoop(ctx)

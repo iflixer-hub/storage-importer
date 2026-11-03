@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +28,9 @@ type App struct {
 	bucket     string
 	clearFiles bool
 	workers    int
-	metrics    *Metrics
+	// quality labels ("720", "480") that may be imported; nil means all
+	allowedQualities map[string]struct{}
+	metrics          *Metrics
 
 	jobHeartbeatInterval time.Duration
 	jobRecoveryTimeout   time.Duration
@@ -315,17 +318,31 @@ func (a *App) clearFilesPath(ctx context.Context, fileID uint64) error {
 	return e
 }
 
-func (a *App) saveQualitiesJSON(ctx context.Context, fileID uint64, m Master) error {
-	// минимально: просто список uri из master (уже относительные)
-	qs := make([]string, 0, len(m.Variants))
-	for _, v := range m.Variants {
-		qs = append(qs, v.URI)
+// parseQualitiesJSON reads qualities_json (["480/index.m3u8", ...]); anything unreadable counts as empty.
+func parseQualitiesJSON(raw string) []string {
+	var qs []string
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &qs) != nil {
+		return nil
 	}
-	// без JSON энкодера для краткости:
-	val := `["` + strings.Join(qs, `","`) + `"]`
+	return qs
+}
+
+func qualityURI(quality string) string {
+	return quality + "/index.m3u8"
+}
+
+// saveQualitiesJSON stores the qualities that are fully imported and are not going to be imported again.
+func (a *App) saveQualitiesJSON(ctx context.Context, fileID uint64, qualities []string) error {
+	if qualities == nil {
+		qualities = []string{}
+	}
+	val, err := json.Marshal(qualities)
+	if err != nil {
+		return err
+	}
 	const q = `UPDATE files_storage SET qualities_json=? WHERE file_id=?`
-	started := logSQLStart("saveQualitiesJSON", q, val, fileID)
-	_, err := a.db.ExecContext(ctx, q, val, fileID)
+	started := logSQLStart("saveQualitiesJSON", q, string(val), fileID)
+	_, err = a.db.ExecContext(ctx, q, string(val), fileID)
 	logSQLFinish("saveQualitiesJSON", started, err)
 	return err
 }
@@ -540,8 +557,9 @@ func (a *App) claimJob(ctx context.Context) (Job, bool, error) {
 
 	var j Job
 	var attempts int
+	var qualitiesJSON sql.NullString
 	const claimSelect = `
-SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts
+SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json
 FROM files_storage
 WHERE status IN ('new','failed')
   AND attempts < 10
@@ -550,7 +568,7 @@ LIMIT 1
 	FOR UPDATE SKIP LOCKED`
 	selectStarted := logSQLStart("claimJob.select", claimSelect)
 	row := tx.QueryRowContext(ctx, claimSelect)
-	err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts)
+	err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts, &qualitiesJSON)
 	logSQLFinish("claimJob.select", selectStarted, err)
 	if errors.Is(err, sql.ErrNoRows) {
 		commitStarted := logSQLStart("claimJob.commit-empty", "COMMIT")
@@ -565,6 +583,7 @@ LIMIT 1
 		return Job{}, false, err
 	}
 	j.AttemptNumber = attempts + 1
+	j.Qualities = parseQualitiesJSON(qualitiesJSON.String)
 
 	const claimUpdate = `
 UPDATE files_storage
@@ -624,7 +643,34 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	playlistsWithChunks := 0
 	firstFailedURL := ""
 
+	// qualities imported completely by earlier attempts are not imported again, they only go back into the master
+	complete := make(map[string]bool, len(j.Qualities))
+	for _, u := range j.Qualities {
+		complete[u] = true
+	}
+	saved := append([]string(nil), j.Qualities...)
+	keptQualities := 0
+	attempted := 0
+	skippedQualities := []string{}
 	for _, v := range master.Variants {
+		quality := guessQualityFromURIOrInf(v.URI, v.StreamInfLine)
+		if quality == "" {
+			quality = "q" + shortHash(v.URI)
+		}
+		uri := qualityURI(quality)
+		if complete[uri] {
+			log.Printf("[job %d] quality=%s already imported, skip", j.FileID, quality)
+			keptQualities++
+			v.URI = uri
+			rewrittenVariants = append(rewrittenVariants, v)
+			continue
+		}
+		if !qualityAllowed(a.allowedQualities, quality, v.StreamInfLine) {
+			skippedQualities = append(skippedQualities, quality)
+			continue
+		}
+		attempted++
+
 		variantAbs := resolveURL(masterURL, v.URI)
 		variantBytes, variantURL, err := a.fetchText(ctx, variantAbs)
 		if err != nil {
@@ -641,10 +687,6 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 			continue
 		}
 
-		quality := guessQualityFromURIOrInf(v.URI, v.StreamInfLine)
-		if quality == "" {
-			quality = "q" + shortHash(v.URI)
-		}
 		log.Printf("[job %d] processing quality=%s variant=%s", j.FileID, quality, variantAbs)
 
 		// качаем/заливаем все “ресурсные URI” плейлиста (сегменты, init.mp4, key и т.п.)
@@ -669,18 +711,35 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		playlistsWithChunks++
 
 		// для master: URI → "<quality>/index.m3u8"
-		v.URI = fmt.Sprintf("%s/index.m3u8", quality)
+		v.URI = uri
 		rewrittenVariants = append(rewrittenVariants, v)
+
+		// only a quality without a single failed chunk counts as imported; the rest is retried on the next run
+		if mediaFirstFailedURL == "" {
+			complete[uri] = true
+			saved = append(saved, uri)
+			if err := a.saveQualitiesJSON(ctx, j.FileID, saved); err != nil {
+				log.Printf("[job %d] save qualities_json failed: %v", j.FileID, err)
+			}
+		}
 	}
 
-	if playlistsFetched == 0 {
-		return processResult{}, fmt.Errorf("no inner playlists fetched")
+	if len(skippedQualities) > 0 {
+		log.Printf("[job %d] skipped qualities not in ALLOWED_QUALITIES: %s", j.FileID, strings.Join(skippedQualities, ","))
 	}
-	if playlistsWithChunks == 0 || len(rewrittenVariants) == 0 {
-		if firstFailedURL != "" {
-			return processResult{}, fmt.Errorf("no chunks imported successfully, first failed url=%s", firstFailedURL)
+	if attempted == 0 && keptQualities == 0 {
+		return processResult{}, fmt.Errorf("no variant matches ALLOWED_QUALITIES, source has: %s", strings.Join(skippedQualities, ","))
+	}
+	if attempted > 0 {
+		if playlistsFetched == 0 {
+			return processResult{}, fmt.Errorf("no inner playlists fetched")
 		}
-		return processResult{}, fmt.Errorf("no chunks imported successfully")
+		if playlistsWithChunks == 0 {
+			if firstFailedURL != "" {
+				return processResult{}, fmt.Errorf("no chunks imported successfully, first failed url=%s", firstFailedURL)
+			}
+			return processResult{}, fmt.Errorf("no chunks imported successfully")
+		}
 	}
 
 	// 2) Собираем master с относительными ссылками, и грузим ПОСЛЕДНИМ
@@ -693,8 +752,16 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	}
 	log.Printf("[job %d] uploaded master key=%s", j.FileID, j.R2MasterKey)
 
-	// для диагностики можно сохранить qualities_json
-	_ = a.saveQualitiesJSON(ctx, j.FileID, master)
+	// qualities_json: only fully imported qualities, in master order
+	finalQualities := make([]string, 0, len(rewrittenVariants))
+	for _, v := range rewrittenVariants {
+		if complete[v.URI] {
+			finalQualities = append(finalQualities, v.URI)
+		}
+	}
+	if err := a.saveQualitiesJSON(ctx, j.FileID, finalQualities); err != nil {
+		log.Printf("[job %d] save qualities_json failed: %v", j.FileID, err)
+	}
 
 	if firstFailedURL != "" {
 		return processResult{partialMessage: buildPartialMessage(firstFailedURL)}, nil
@@ -710,6 +777,12 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		return processResult{}, fmt.Errorf("parse as media: %w", err)
 	}
 	quality := "default"
+	for _, u := range j.Qualities {
+		if u == qualityURI(quality) {
+			log.Printf("[job %d] single playlist already imported, skip", j.FileID)
+			return processResult{}, nil
+		}
+	}
 	log.Printf("[job %d] processing single playlist quality=%s", j.FileID, quality)
 
 	rewrittenMedia, successfulSegments, firstFailedURL := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media)
@@ -739,5 +812,8 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		return processResult{partialMessage: buildPartialMessage(firstFailedURL)}, nil
 	}
 
+	if err := a.saveQualitiesJSON(ctx, j.FileID, []string{qualityURI(quality)}); err != nil {
+		log.Printf("[job %d] save qualities_json failed: %v", j.FileID, err)
+	}
 	return processResult{}, nil
 }

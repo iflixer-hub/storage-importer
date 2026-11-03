@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -71,6 +72,61 @@ func guessQualityFromURIOrInf(uri, streamInf string) string {
 		return strings.ReplaceAll(rest, "x", "p") // грубо: 854p474 (можешь поменять)
 	}
 	return ""
+}
+
+// parseQualityList turns "720,480" (commas or spaces, an optional "p" suffix) into a set. Empty means no limit.
+func parseQualityList(raw string) map[string]struct{} {
+	set := map[string]struct{}{}
+	for _, item := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == ';' }) {
+		item = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(item)), "p")
+		if item != "" {
+			set[item] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return set
+}
+
+func sortedQualities(set map[string]struct{}) []string {
+	list := make([]string, 0, len(set))
+	for q := range set {
+		list = append(list, q)
+	}
+	sort.Strings(list)
+	return list
+}
+
+// variantHeight returns the height from "RESOLUTION=WxH" of a STREAM-INF line, or "".
+func variantHeight(streamInf string) string {
+	i := strings.Index(streamInf, "RESOLUTION=")
+	if i < 0 {
+		return ""
+	}
+	rest := streamInf[i+len("RESOLUTION="):]
+	if j := strings.IndexAny(rest, ", \t"); j >= 0 {
+		rest = rest[:j]
+	}
+	if x := strings.IndexAny(rest, "xX"); x >= 0 && isDigits(rest[x+1:]) {
+		return rest[x+1:]
+	}
+	return ""
+}
+
+// qualityAllowed reports whether a variant passes the allow-list: either its folder label or its real height is listed.
+func qualityAllowed(allowed map[string]struct{}, quality, streamInf string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if _, ok := allowed[quality]; ok {
+		return true
+	}
+	if h := variantHeight(streamInf); h != "" {
+		_, ok := allowed[h]
+		return ok
+	}
+	return false
 }
 
 func isDigits(s string) bool {
