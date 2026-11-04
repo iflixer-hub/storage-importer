@@ -65,7 +65,7 @@ func main() {
 	httpClient := &http.Client{
 		Timeout: 120 * time.Second,
 		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
+			Proxy:               proxyForRequest,
 			ForceAttemptHTTP2:   false,
 			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
 			MaxIdleConns:        200,
@@ -96,6 +96,7 @@ func main() {
 	app := &App{
 		db:         db,
 		httpClient: httpClient,
+		proxies:    newProxyPool(db, proxyListTTL),
 		s3:         s3c,
 		uploader:   manager.NewUploader(s3c),
 

@@ -22,6 +22,7 @@ import (
 type App struct {
 	db         *sql.DB
 	httpClient *http.Client
+	proxies    *proxyPool
 	s3         *s3.Client
 	uploader   *manager.Uploader
 
@@ -608,6 +609,9 @@ SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
 }
 
 func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
+	proxy := a.proxies.next(ctx)
+	ctx = withSourceProxy(ctx, proxy)
+	log.Printf("[job %d] source proxy=%s", j.FileID, proxyEndpoint(proxy))
 	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
 	if err != nil {

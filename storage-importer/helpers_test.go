@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/url"
+	"testing"
+)
 
 func TestQualityAllowed(t *testing.T) {
 	const inf = "#EXT-X-STREAM-INF:RESOLUTION=854x430,BANDWIDTH=714000"
@@ -34,5 +38,33 @@ func TestParseQualitiesJSON(t *testing.T) {
 		if got := parseQualitiesJSON(raw); len(got) != 0 {
 			t.Errorf("%q: expected empty, got %v", raw, got)
 		}
+	}
+}
+
+func TestParseProxyList(t *testing.T) {
+	list := parseProxyList(`["http://u:p@isp.decodo.com:10004"," http://u:p@isp.decodo.com:10005","","bad","ftp://x:1"]`)
+	if len(list) != 2 || list[0].Host != "isp.decodo.com:10004" || list[1].Port() != "10005" {
+		t.Fatalf("unexpected %v", list)
+	}
+	if proxyEndpoint(list[0]) != "isp.decodo.com:10004" {
+		t.Errorf("endpoint leaks more than host:port: %s", proxyEndpoint(list[0]))
+	}
+	for _, raw := range []string{"", "null", "{}", "garbage"} {
+		if got := parseProxyList(raw); len(got) != 0 {
+			t.Errorf("%q: expected empty, got %v", raw, got)
+		}
+	}
+}
+
+func TestProxyForRequest(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://warp:1080")
+	req, _ := http.NewRequest("GET", "https://ashdi.vip/x", nil)
+	if u, _ := proxyForRequest(req); u == nil || u.Host != "warp:1080" {
+		t.Errorf("without a pinned proxy the environment proxy is expected, got %v", u)
+	}
+	pinned, _ := url.Parse("http://u:p@isp.decodo.com:10004")
+	req = req.WithContext(withSourceProxy(req.Context(), pinned))
+	if u, _ := proxyForRequest(req); u == nil || u.Host != "isp.decodo.com:10004" || u.User == nil {
+		t.Errorf("pinned proxy expected, got %v", u)
 	}
 }
