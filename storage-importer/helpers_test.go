@@ -1,9 +1,13 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestQualityAllowed(t *testing.T) {
@@ -66,5 +70,76 @@ func TestProxyForRequest(t *testing.T) {
 	req = req.WithContext(withSourceProxy(req.Context(), pinned))
 	if u, _ := proxyForRequest(req); u == nil || u.Host != "isp.decodo.com:10004" || u.User == nil {
 		t.Errorf("pinned proxy expected, got %v", u)
+	}
+}
+
+type fakeRT struct {
+	mu    sync.Mutex
+	times []time.Time
+	codes []int
+}
+
+func (f *fakeRT) RoundTrip(*http.Request) (*http.Response, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.times = append(f.times, time.Now())
+	code := 200
+	if len(f.codes) >= len(f.times) {
+		code = f.codes[len(f.times)-1]
+	}
+	return &http.Response{StatusCode: code, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+}
+
+func TestThrottleSpacesRequests(t *testing.T) {
+	f := &fakeRT{}
+	tr := newThrottledTransport(f, 50*time.Millisecond, 0)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest("GET", "http://x/", nil)
+			if _, err := tr.RoundTrip(req); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	// 5 requests, 4 gaps of at least 0.8*50ms
+	if got := time.Since(start); got < 150*time.Millisecond {
+		t.Errorf("requests were not spaced out: %v", got)
+	}
+	// another proxy has its own schedule
+	other, _ := url.Parse("http://u:p@proxy2:1")
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	req = req.WithContext(withSourceProxy(req.Context(), other))
+	s := time.Now()
+	_, _ = tr.RoundTrip(req)
+	if time.Since(s) > 20*time.Millisecond {
+		t.Errorf("a different proxy must not wait for the first one")
+	}
+}
+
+func TestThrottleRetriesOn429(t *testing.T) {
+	f := &fakeRT{codes: []int{429, 429, 200}}
+	tr := newThrottledTransport(f, 0, 3)
+	tr.backoff = 10 * time.Millisecond
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 || len(f.times) != 3 {
+		t.Fatalf("resp=%v err=%v calls=%d", resp, err, len(f.times))
+	}
+	if gap := f.times[2].Sub(f.times[1]); gap < 18*time.Millisecond {
+		t.Errorf("backoff should double: %v", gap)
+	}
+
+	// retries exhausted: the 429 is handed back to the caller
+	f = &fakeRT{codes: []int{429, 429, 429}}
+	tr = newThrottledTransport(f, 0, 1)
+	tr.backoff = time.Millisecond
+	resp, _ = tr.RoundTrip(req)
+	if resp.StatusCode != 429 || len(f.times) != 2 {
+		t.Errorf("status=%d calls=%d", resp.StatusCode, len(f.times))
 	}
 }

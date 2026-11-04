@@ -62,17 +62,22 @@ func main() {
 	db.SetMaxOpenConns(10)
 	db.SetConnMaxLifetime(2 * time.Minute)
 
+	sourceTransport := &http.Transport{
+		Proxy:               proxyForRequest,
+		ForceAttemptHTTP2:   false,
+		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+	}
 	httpClient := &http.Client{
 		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			Proxy:               proxyForRequest,
-			ForceAttemptHTTP2:   false,
-			TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
-			MaxIdleConns:        200,
-			MaxIdleConnsPerHost: 200,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
-		},
+		Transport: newThrottledTransport(
+			sourceTransport,
+			time.Duration(envInt("SOURCE_REQUEST_DELAY_MS", 0))*time.Millisecond,
+			envInt("SOURCE_429_RETRIES", 3),
+		),
 	}
 	r2Transport := http.DefaultTransport.(*http.Transport).Clone()
 	r2Transport.Proxy = nil
@@ -118,7 +123,7 @@ func main() {
 
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
-	log.Printf("start: allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
+	log.Printf("start: sourceDelayMs=%d source429Retries=%d allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", envInt("SOURCE_REQUEST_DELAY_MS", 0), envInt("SOURCE_429_RETRIES", 3), sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()
 	go app.recoveryLoop(ctx)
