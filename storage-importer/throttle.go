@@ -19,6 +19,9 @@ type throttledTransport struct {
 	maxRetries int           // retries after a 429
 	backoff    time.Duration // first wait after a 429 when the response has no Retry-After, doubles each retry
 
+	onRateLimited func(key string)                  // a 429 was received
+	onWait        func(key string, d time.Duration) // time spent waiting for a free slot
+
 	mu   sync.Mutex
 	next map[string]time.Time
 }
@@ -39,10 +42,17 @@ func throttleKey(req *http.Request) string {
 func (t *throttledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	key := throttleKey(req)
 	for attempt := 0; ; attempt++ {
-		if err := t.wait(req.Context(), key); err != nil {
+		waited, err := t.wait(req.Context(), key)
+		if t.onWait != nil && waited > 0 {
+			t.onWait(key, waited)
+		}
+		if err != nil {
 			return nil, err
 		}
 		resp, err := t.base.RoundTrip(req)
+		if err == nil && resp.StatusCode == http.StatusTooManyRequests && t.onRateLimited != nil {
+			t.onRateLimited(key)
+		}
 		if err != nil || resp.StatusCode != http.StatusTooManyRequests || attempt >= t.maxRetries {
 			return resp, err
 		}
@@ -56,7 +66,7 @@ func (t *throttledTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // wait reserves the next free slot for key and sleeps until it comes.
-func (t *throttledTransport) wait(ctx context.Context, key string) error {
+func (t *throttledTransport) wait(ctx context.Context, key string) (time.Duration, error) {
 	t.mu.Lock()
 	now := time.Now()
 	slot := t.next[key]
@@ -68,15 +78,15 @@ func (t *throttledTransport) wait(ctx context.Context, key string) error {
 
 	d := time.Until(slot)
 	if d <= 0 {
-		return nil
+		return 0, nil
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return nil
+		return d, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 }
 

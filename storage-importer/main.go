@@ -71,14 +71,12 @@ func main() {
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
 	}
-	httpClient := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: newThrottledTransport(
-			sourceTransport,
-			time.Duration(envInt("SOURCE_REQUEST_DELAY_MS", 0))*time.Millisecond,
-			envInt("SOURCE_429_RETRIES", 3),
-		),
-	}
+	throttle := newThrottledTransport(
+		sourceTransport,
+		time.Duration(envInt("SOURCE_REQUEST_DELAY_MS", 0))*time.Millisecond,
+		envInt("SOURCE_429_RETRIES", 3),
+	)
+	httpClient := &http.Client{Timeout: 120 * time.Second, Transport: throttle}
 	r2Transport := http.DefaultTransport.(*http.Transport).Clone()
 	r2Transport.Proxy = nil
 	r2HTTPClient := &http.Client{
@@ -118,6 +116,10 @@ func main() {
 
 	metrics := NewMetrics()
 	app.metrics = metrics
+	throttle.onRateLimited = func(proxy string) { metrics.sourceRateLimited.WithLabelValues(proxy).Inc() }
+	throttle.onWait = func(proxy string, d time.Duration) {
+		metrics.sourceThrottleWait.WithLabelValues(proxy).Add(d.Seconds())
+	}
 
 	go startDBStatsLoop(context.Background(), db, metrics, 30*time.Second)
 

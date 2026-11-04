@@ -143,3 +143,20 @@ func TestThrottleRetriesOn429(t *testing.T) {
 		t.Errorf("status=%d calls=%d", resp.StatusCode, len(f.times))
 	}
 }
+
+func TestThrottleCallbacks(t *testing.T) {
+	f := &fakeRT{codes: []int{429, 200}}
+	tr := newThrottledTransport(f, 10*time.Millisecond, 2)
+	tr.backoff = 5 * time.Millisecond
+	limited := 0
+	var waited time.Duration
+	tr.onRateLimited = func(string) { limited++ }
+	tr.onWait = func(_ string, d time.Duration) { waited += d }
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	if _, err := tr.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	if limited != 1 || waited <= 0 {
+		t.Errorf("limited=%d waited=%v", limited, waited)
+	}
+}

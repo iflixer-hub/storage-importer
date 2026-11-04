@@ -249,6 +249,7 @@ func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
 		ContentType: aws.String(ct),
 	})
 	if err != nil {
+		a.metrics.s3Errors.WithLabelValues("object").Inc()
 		return fmt.Errorf("put %s: %w", dstKey, err)
 	}
 
@@ -422,8 +423,12 @@ func (a *App) worker(ctx context.Context, idx int) {
 			}
 		} else {
 			a.metrics.lastSuccessTs.Set(float64(time.Now().Unix()))
-			a.metrics.jobsTotal.WithLabelValues("done").Inc()
-			a.metrics.jobDuration.WithLabelValues("done").Observe(time.Since(start).Seconds())
+			outcome := "done"
+			if result.partialMessage != "" {
+				outcome = "partial"
+			}
+			a.metrics.jobsTotal.WithLabelValues(outcome).Inc()
+			a.metrics.jobDuration.WithLabelValues(outcome).Observe(time.Since(start).Seconds())
 			if result.partialMessage != "" {
 				log.Printf("[w%d] job file_id=%d DONE PARTIAL: %s", idx, job.FileID, result.partialMessage)
 			} else {
@@ -611,6 +616,7 @@ SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
 func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	proxy := a.proxies.next(ctx)
 	ctx = withSourceProxy(ctx, proxy)
+	a.metrics.proxyJobs.WithLabelValues(proxyEndpoint(proxy)).Inc()
 	log.Printf("[job %d] source proxy=%s", j.FileID, proxyEndpoint(proxy))
 	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
@@ -664,6 +670,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		uri := qualityURI(quality)
 		if complete[uri] {
 			log.Printf("[job %d] quality=%s already imported, skip", j.FileID, quality)
+			a.metrics.qualitiesTotal.WithLabelValues("kept").Inc()
 			keptQualities++
 			v.URI = uri
 			rewrittenVariants = append(rewrittenVariants, v)
@@ -671,6 +678,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		}
 		if !qualityAllowed(a.allowedQualities, quality, v.StreamInfLine) {
 			skippedQualities = append(skippedQualities, quality)
+			a.metrics.qualitiesTotal.WithLabelValues("skipped").Inc()
 			continue
 		}
 		attempted++
@@ -680,6 +688,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		if err != nil {
 			log.Printf("[job %d] partial: fetch variant failed url=%s err=%v", j.FileID, variantAbs, err)
 			setFirstFailedURL(&firstFailedURL, variantAbs)
+			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 			continue
 		}
 		playlistsFetched++
@@ -688,6 +697,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		if err != nil {
 			log.Printf("[job %d] partial: parse variant failed url=%s err=%v", j.FileID, variantAbs, err)
 			setFirstFailedURL(&firstFailedURL, variantAbs)
+			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 			continue
 		}
 
@@ -702,6 +712,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 			if mediaFirstFailedURL == "" {
 				setFirstFailedURL(&firstFailedURL, variantAbs)
 			}
+			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 			continue
 		}
 
@@ -710,6 +721,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		if err := a.putObjectText(ctx, key, rewrittenMedia.Render()); err != nil {
 			log.Printf("[job %d] partial: upload quality playlist failed key=%s err=%v", j.FileID, key, err)
 			setFirstFailedURL(&firstFailedURL, variantAbs)
+			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 			continue
 		}
 		playlistsWithChunks++
@@ -719,6 +731,11 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		rewrittenVariants = append(rewrittenVariants, v)
 
 		// only a quality without a single failed chunk counts as imported; the rest is retried on the next run
+		if mediaFirstFailedURL != "" {
+			a.metrics.qualitiesTotal.WithLabelValues("partial").Inc()
+		} else {
+			a.metrics.qualitiesTotal.WithLabelValues("imported").Inc()
+		}
 		if mediaFirstFailedURL == "" {
 			complete[uri] = true
 			saved = append(saved, uri)

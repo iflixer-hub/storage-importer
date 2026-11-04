@@ -28,16 +28,25 @@ type Metrics struct {
 
 	lastSuccessTs prometheus.Gauge
 
+	qualitiesTotal     *prometheus.CounterVec
+	proxyJobs          *prometheus.CounterVec
+	sourceRateLimited  *prometheus.CounterVec
+	sourceThrottleWait *prometheus.CounterVec
+	s3Errors           *prometheus.CounterVec
+
 	dbJobsTotal   prometheus.Gauge
 	dbJobsDone    prometheus.Gauge
 	dbJobsRunning prometheus.Gauge
 	dbJobsFailed  prometheus.Gauge
+	dbJobsNew     prometheus.Gauge
+	dbJobsPartial prometheus.Gauge
+	dbJobsDead    prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
 	m := &Metrics{
 		jobsTotal: prometheus.NewCounterVec(
-			prometheus.CounterOpts{Name: "import_jobs_total", Help: "Total jobs by result"},
+			prometheus.CounterOpts{Name: "import_jobs_total", Help: "Jobs by result: claimed, done (clean), partial (done with failed chunks), failed"},
 			[]string{"result"},
 		),
 		jobDuration: prometheus.NewHistogramVec(
@@ -86,10 +95,34 @@ func NewMetrics() *Metrics {
 			Name: "import_last_success_timestamp_seconds",
 			Help: "Unix timestamp of last successful job",
 		}),
+		qualitiesTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "import_qualities_total", Help: "Qualities by result: imported, partial (some chunks failed), failed, kept (already imported), skipped (not in ALLOWED_QUALITIES)"},
+			[]string{"result"},
+		),
+		proxyJobs: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "import_proxy_jobs_total", Help: "Jobs started per source proxy (host:port, \"env\" when the environment proxy is used)"},
+			[]string{"proxy"},
+		),
+		sourceRateLimited: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "import_source_rate_limited_total", Help: "429 responses from the source per proxy"},
+			[]string{"proxy"},
+		),
+		sourceThrottleWait: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "import_source_throttle_wait_seconds_total", Help: "Time requests spent waiting for the pause between requests and 429 backoff, per proxy"},
+			[]string{"proxy"},
+		),
+		s3Errors: prometheus.NewCounterVec(
+			prometheus.CounterOpts{Name: "import_s3_errors_total", Help: "Failed uploads to the storage by kind (playlist, object)"},
+			[]string{"op"},
+		),
+
 		dbJobsTotal:   prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_total", Help: "Total jobs in DB"}),
 		dbJobsDone:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_done", Help: "Done jobs in DB"}),
 		dbJobsRunning: prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_running", Help: "Running jobs in DB"}),
-		dbJobsFailed:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_failed", Help: "Failed jobs in DB"}),
+		dbJobsFailed:  prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_failed", Help: "Failed jobs in DB (waiting for a retry or out of attempts)"}),
+		dbJobsNew:     prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_new", Help: "Jobs in DB waiting in the queue (status new)"}),
+		dbJobsPartial: prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_partial", Help: "Done jobs in DB that finished with failed chunks (last_error starts with partial)"}),
+		dbJobsDead:    prometheus.NewGauge(prometheus.GaugeOpts{Name: "import_db_jobs_dead", Help: "Failed jobs in DB that used all 10 attempts and will not be retried"}),
 	}
 
 	prometheus.MustRegister(
@@ -99,6 +132,8 @@ func NewMetrics() *Metrics {
 		m.curSegTotal, m.curSegDone,
 		m.lastSuccessTs,
 		m.dbJobsTotal, m.dbJobsDone, m.dbJobsRunning, m.dbJobsFailed,
+		m.dbJobsNew, m.dbJobsPartial, m.dbJobsDead,
+		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors,
 	)
 	return m
 }

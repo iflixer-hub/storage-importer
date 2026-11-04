@@ -30,6 +30,17 @@
 
 Ограничитель работает внутри одного процесса: при нескольких нодах (`mode: global`) каждая нода держит свою паузу, то есть общий темп на один прокси выше.
 
+# Метрики
+
+`:9090/metrics` (`METRICS_ADDR`), в swarm их собирает job `importer` в `swarm/monitor/prometheus/prometheus.yml`, дашборд — `swarm/monitor/grafana/provisioning/dashboards/importer.json`.
+
+- `import_jobs_total{result}` — `claimed`, `done`, `partial` (завершено с упавшими чанками), `failed`; `import_job_duration_seconds{result}`; `import_inflight_jobs`; `import_last_success_timestamp_seconds`.
+- `import_qualities_total{result}` — `imported`, `partial`, `failed`, `kept` (уже было импортировано), `skipped` (не в `ALLOWED_QUALITIES`).
+- `import_db_jobs_{total,new,running,done,failed,partial,dead}` — состояние очереди в БД (одинаковое на всех нодах, брать `max`). `dead` — `failed` с исчерпанными 10 попытками.
+- `import_http_requests_total{kind,code}`, `import_http_duration_seconds{kind}`, `import_bytes_total{dir}`, `import_objects_total{type}` — обмен с источником и хранилищем.
+- `import_proxy_jobs_total{proxy}`, `import_source_rate_limited_total{proxy}` (429), `import_source_throttle_wait_seconds_total{proxy}` — прокси источника (`proxy` — `host:port`, `env` для HTTP(S)_PROXY).
+- `import_s3_errors_total{op}` — ошибки записи в хранилище (`playlist`, `object`).
+
 # qualities_json и повторный импорт
 
 В `files_storage.qualities_json` хранится список полностью импортированных качеств, например `["480/index.m3u8","720/index.m3u8"]`.

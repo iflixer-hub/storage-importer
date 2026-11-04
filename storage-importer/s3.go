@@ -19,6 +19,9 @@ func (a *App) putObjectText(ctx context.Context, key, text string) error {
 		ContentType:  aws.String("application/vnd.apple.mpegurl"),
 		CacheControl: aws.String("public, max-age=31536000, immutable"),
 	})
+	if err != nil {
+		a.metrics.s3Errors.WithLabelValues("playlist").Inc()
+	}
 	return err
 }
 
