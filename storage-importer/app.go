@@ -96,7 +96,8 @@ func logSQLFinish(op string, started time.Time, err error) {
 
 // rewriteAndStoreMedia mirrors every resource of a media playlist. A 404 of the source stops it at once and is returned
 // as the last value: the resource is gone, so the rest of the file is not worth downloading.
-func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL string, media Media) (Media, int, string, error) {
+// have holds the names already present in the quality folder of the storage (nil: none); such objects are not downloaded again.
+func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL string, media Media, have map[string]bool) (Media, int, string, error) {
 	// все URI строки: сегменты / init / key и т.д.
 	// сделаем:
 	// - сегменты нумеруем 1.ts..N.ts
@@ -123,7 +124,7 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 			// Если это #EXT-X-KEY или #EXT-X-MAP и внутри есть URI="..."
 			// то тоже нужно скачать/залить и переписать URI на относительный путь.
 			if strings.HasPrefix(l.Tag, "#EXT-X-KEY:") || strings.HasPrefix(l.Tag, "#EXT-X-MAP:") {
-				newTag, err := a.rewriteURIInsideTag(ctx, j, quality, baseURL, l.Tag)
+				newTag, err := a.rewriteURIInsideTag(ctx, j, quality, baseURL, l.Tag, have)
 				if err != nil {
 					failedURI := resolveURL(baseURL, extractURIFromTag(l.Tag))
 					if isSourceNotFound(err) {
@@ -149,7 +150,10 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 			dstName := fmt.Sprintf("%d.ts", segIndex)
 			dstKey := fmt.Sprintf("%s/%s/%s", j.R2Prefix, quality, dstName)
 
-			if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+			if have[dstName] {
+				// stored by an earlier attempt (an object appears in the storage only when it is complete)
+				a.metrics.objectsReused.Inc()
+			} else if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
 				if isSourceNotFound(err) {
 					return rewritten, successfulSegments, abs, err
 				}
@@ -168,7 +172,9 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 				base = "file-" + shortHash(l.URI)
 			}
 			dstKey := fmt.Sprintf("%s/%s/%s", j.R2Prefix, quality, base)
-			if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+			if have[base] {
+				a.metrics.objectsReused.Inc()
+			} else if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
 				if isSourceNotFound(err) {
 					return rewritten, successfulSegments, abs, err
 				}
@@ -183,7 +189,7 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 	return rewritten, successfulSegments, firstFailedURL, nil
 }
 
-func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, tagLine string) (string, error) {
+func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, tagLine string, have map[string]bool) (string, error) {
 	// ищем URI="..."
 	// делаем очень аккуратную замену только этого значения.
 	const needle = `URI="`
@@ -207,7 +213,9 @@ func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, 
 	}
 	dstKey := fmt.Sprintf("%s/%s/%s", j.R2Prefix, quality, base)
 
-	if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+	if have[base] {
+		a.metrics.objectsReused.Inc()
+	} else if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
 		return "", err
 	}
 
@@ -684,12 +692,53 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	playlistsWithChunks := 0
 	firstFailedURL := ""
 
-	// qualities imported completely by earlier attempts are not imported again, they only go back into the master
+	// qualities imported completely are not imported again, they only go back into the master. qualities_json is just a
+	// hint (the bucket may have been replaced), so the storage decides: the playlist of a quality and every chunk it
+	// lists must be there. Chunks of a quality that is not complete are reused where they exist.
 	complete := make(map[string]bool, len(j.Qualities))
 	for _, u := range j.Qualities {
 		complete[u] = true
 	}
-	saved := append([]string(nil), j.Qualities...)
+	have := make(map[string]map[string]bool)
+	for _, v := range master.Variants {
+		quality := guessQualityFromURIOrInf(v.URI, v.StreamInfLine)
+		if quality == "" {
+			quality = "q" + shortHash(v.URI)
+		}
+		uri := qualityURI(quality)
+		if !complete[uri] && !qualityAllowed(a.allowedQualities, quality, v.StreamInfLine) {
+			continue
+		}
+		ok, names, err := a.verifyQualityInStorage(ctx, j, quality)
+		if err != nil {
+			// without an answer the qualities_json hint stays; an import would fail on the same storage anyway
+			log.Printf("[job %d] cannot verify quality=%s in the storage: %v", j.FileID, quality, err)
+			continue
+		}
+		if complete[uri] && !ok {
+			log.Printf("[job %d] quality=%s is in qualities_json but not (completely) in the storage, importing it again", j.FileID, quality)
+		}
+		if ok {
+			log.Printf("[job %d] quality=%s is complete in the storage (%d objects)", j.FileID, quality, len(names))
+		}
+		complete[uri] = ok
+		have[quality] = names
+	}
+	saved := make([]string, 0, len(complete))
+	for _, v := range master.Variants {
+		quality := guessQualityFromURIOrInf(v.URI, v.StreamInfLine)
+		if quality == "" {
+			quality = "q" + shortHash(v.URI)
+		}
+		if uri := qualityURI(quality); complete[uri] {
+			saved = append(saved, uri)
+		}
+	}
+	if !equalStrings(saved, j.Qualities) {
+		if err := a.saveQualitiesJSON(ctx, j.FileID, saved); err != nil {
+			log.Printf("[job %d] save qualities_json failed: %v", j.FileID, err)
+		}
+	}
 	keptQualities := 0
 	attempted := 0
 	skippedQualities := []string{}
@@ -740,7 +789,7 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 
 		// качаем/заливаем все “ресурсные URI” плейлиста (сегменты, init.mp4, key и т.п.)
 		// и переписываем плейлист на относительные пути с нумерацией ts.
-		rewrittenMedia, successfulSegments, mediaFirstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, variantURL, media)
+		rewrittenMedia, successfulSegments, mediaFirstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, variantURL, media, have[quality])
 		if goneErr != nil {
 			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 			return processResult{}, &permanentError{fmt.Errorf("source file is gone: quality=%s: %w", quality, goneErr)}
@@ -807,10 +856,13 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	masterOut := master.Render()
 
 	// важно: master заливаем последним
-	if err := a.putObjectText(ctx, j.R2MasterKey, masterOut); err != nil {
+	if attempted == 0 && a.storedMasterEquals(ctx, j.R2MasterKey, masterOut) {
+		log.Printf("[job %d] everything is already in the storage, nothing to import (master key=%s is up to date)", j.FileID, j.R2MasterKey)
+	} else if err := a.putObjectText(ctx, j.R2MasterKey, masterOut); err != nil {
 		return processResult{}, fmt.Errorf("upload master %s: %w", j.R2MasterKey, err)
+	} else {
+		log.Printf("[job %d] uploaded master key=%s", j.FileID, j.R2MasterKey)
 	}
-	log.Printf("[job %d] uploaded master key=%s", j.FileID, j.R2MasterKey)
 
 	// qualities_json: only fully imported qualities, in master order
 	finalQualities := make([]string, 0, len(rewrittenVariants))
@@ -837,15 +889,22 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		return processResult{}, fmt.Errorf("parse as media: %w", err)
 	}
 	quality := "default"
-	for _, u := range j.Qualities {
-		if u == qualityURI(quality) {
-			log.Printf("[job %d] single playlist already imported, skip", j.FileID)
-			return processResult{}, nil
+	var have map[string]bool
+	if ok, names, err := a.verifyQualityInStorage(ctx, j, quality); err != nil {
+		log.Printf("[job %d] cannot verify quality=%s in the storage: %v", j.FileID, quality, err)
+	} else if ok {
+		log.Printf("[job %d] single playlist is complete in the storage, nothing to import", j.FileID)
+		a.metrics.qualitiesTotal.WithLabelValues("kept").Inc()
+		if !equalStrings(j.Qualities, []string{qualityURI(quality)}) {
+			_ = a.saveQualitiesJSON(ctx, j.FileID, []string{qualityURI(quality)})
 		}
+		return processResult{}, nil
+	} else {
+		have = names
 	}
 	log.Printf("[job %d] processing single playlist quality=%s", j.FileID, quality)
 
-	rewrittenMedia, successfulSegments, firstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media)
+	rewrittenMedia, successfulSegments, firstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media, have)
 	if goneErr != nil {
 		a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
 		return processResult{}, &permanentError{fmt.Errorf("source file is gone: %w", goneErr)}

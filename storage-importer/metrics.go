@@ -33,6 +33,7 @@ type Metrics struct {
 	sourceRateLimited  *prometheus.CounterVec
 	sourceThrottleWait *prometheus.CounterVec
 	s3Errors           *prometheus.CounterVec
+	objectsReused      prometheus.Counter
 
 	dbJobsTotal   prometheus.Gauge
 	dbJobsDone    prometheus.Gauge
@@ -111,6 +112,9 @@ func NewMetrics() *Metrics {
 			prometheus.CounterOpts{Name: "import_source_throttle_wait_seconds_total", Help: "Time requests spent waiting for the pause between requests and 429 backoff, per proxy"},
 			[]string{"proxy"},
 		),
+		objectsReused: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "import_objects_reused_total", Help: "Chunks and other objects found in the storage and not downloaded again",
+		}),
 		s3Errors: prometheus.NewCounterVec(
 			prometheus.CounterOpts{Name: "import_s3_errors_total", Help: "Failed uploads to the storage by kind (playlist, object)"},
 			[]string{"op"},
@@ -133,7 +137,7 @@ func NewMetrics() *Metrics {
 		m.lastSuccessTs,
 		m.dbJobsTotal, m.dbJobsDone, m.dbJobsRunning, m.dbJobsFailed,
 		m.dbJobsNew, m.dbJobsPartial, m.dbJobsDead,
-		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors,
+		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors, m.objectsReused,
 	)
 	return m
 }
