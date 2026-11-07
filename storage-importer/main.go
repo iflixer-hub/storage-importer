@@ -76,7 +76,8 @@ func main() {
 		time.Duration(envInt("SOURCE_REQUEST_DELAY_MS", 0))*time.Millisecond,
 		envInt("SOURCE_429_RETRIES", 3),
 	)
-	httpClient := &http.Client{Timeout: 120 * time.Second, Transport: throttle}
+	sourceHeaders := browserHeadersFromEnv()
+	httpClient := &http.Client{Timeout: 120 * time.Second, Transport: &browserHeadersTransport{base: throttle, headers: sourceHeaders}}
 	r2Transport := http.DefaultTransport.(*http.Transport).Clone()
 	r2Transport.Proxy = nil
 	r2HTTPClient := &http.Client{
@@ -126,6 +127,7 @@ func main() {
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
 	log.Printf("source proxies: settings row %q", app.proxies.setting)
+	log.Printf("source request headers: user-agent=%q referer=%q", sourceHeaders.Get("User-Agent"), sourceHeaders.Get("Referer"))
 	log.Printf("start: sourceDelayMs=%d source429Retries=%d allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", envInt("SOURCE_REQUEST_DELAY_MS", 0), envInt("SOURCE_429_RETRIES", 3), sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()

@@ -23,6 +23,15 @@
 
 Какую строку `settings` использовать, задаёт `SOURCE_PROXIES_SETTING` (по умолчанию `ashdi_proxies`; например `luxhost_proxies` для другого провайдера). Формат списка тот же. Имя выбранной строки пишется в лог при старте: `source proxies: settings row "luxhost_proxies"`; список перечитывается раз в 10 минут, смена переменной требует перезапуска сервиса.
 
+# Заголовки запросов к источнику
+
+Источник отвечает `403` на запросы с `User-Agent: Go-http-client` (проверено через прокси: с браузерным `User-Agent` `200`, с Go `403`), поэтому каждый запрос к нему идёт с заголовками браузера (тот же профиль Chrome 140, что в flixhub-mono): `User-Agent`, `Accept`, `Accept-Language`, `Referer`, `Origin`, `Sec-Fetch-*`, `Sec-CH-UA*`. `Accept-Encoding` не задаётся: Go сам просит gzip и сам его распаковывает.
+- `SOURCE_USER_AGENT` - `User-Agent` (по умолчанию Chrome 140 на Windows; `Sec-CH-UA*` добавляются только для него)
+- `SOURCE_REFERER` - страница-источник запроса (по умолчанию `https://uakino.best/`), из неё же берётся `Origin`
+- `SOURCE_ACCEPT_LANGUAGE` - по умолчанию `uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7`
+
+Значения при старте пишутся в лог: `source request headers: user-agent=… referer=…`. Загрузка в S3 этих заголовков не получает.
+
 # Паузы и 429
 
 Источник (ashdi, DDoS-Guard) режет по числу запросов с одного IP. Поэтому запросы к источнику идут через общий ограничитель на каждый прокси:

@@ -169,3 +169,60 @@ func TestProxyPoolSettingName(t *testing.T) {
 		t.Errorf("custom setting = %q", got)
 	}
 }
+
+type captureRT struct{ got *http.Request }
+
+func (c *captureRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.got = r
+	return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+}
+
+func TestBrowserHeadersTransport(t *testing.T) {
+	capture := &captureRT{}
+	tr := &browserHeadersTransport{base: capture, headers: browserHeaders(defaultSourceUserAgent, "https://uakino.best/", defaultSourceLanguage)}
+
+	req, _ := http.NewRequest("GET", "https://ashdi.vip/x/index.m3u8", nil)
+	if _, err := tr.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	got := capture.got.Header
+	if !strings.Contains(got.Get("User-Agent"), "Chrome/140") || strings.Contains(got.Get("User-Agent"), "Go-http-client") {
+		t.Errorf("user agent = %q", got.Get("User-Agent"))
+	}
+	if got.Get("Referer") != "https://uakino.best/" || got.Get("Origin") != "https://uakino.best" {
+		t.Errorf("referer/origin = %q / %q", got.Get("Referer"), got.Get("Origin"))
+	}
+	if got.Get("Accept-Encoding") != "" {
+		t.Error("Accept-Encoding must stay unset so that Go unpacks gzip by itself")
+	}
+	if req.Header.Get("User-Agent") != "" {
+		t.Error("the caller's request must not be modified")
+	}
+
+	// headers set by the caller win
+	req, _ = http.NewRequest("GET", "https://ashdi.vip/x.ts", nil)
+	req.Header.Set("User-Agent", "custom")
+	if _, err := tr.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	if capture.got.Header.Get("User-Agent") != "custom" {
+		t.Errorf("user agent = %q", capture.got.Header.Get("User-Agent"))
+	}
+}
+
+func TestBrowserHeadersFromEnv(t *testing.T) {
+	t.Setenv("SOURCE_USER_AGENT", "Mozilla/5.0 Test")
+	t.Setenv("SOURCE_REFERER", "https://example.org/page")
+	h := browserHeadersFromEnv()
+	if h.Get("User-Agent") != "Mozilla/5.0 Test" || h.Get("Referer") != "https://example.org/page" || h.Get("Origin") != "https://example.org" {
+		t.Errorf("headers = %v", h)
+	}
+	if h.Get("Sec-CH-UA") != "" {
+		t.Error("client hints belong to the Chrome profile only")
+	}
+	t.Setenv("SOURCE_USER_AGENT", "")
+	t.Setenv("SOURCE_REFERER", "")
+	if got := browserHeadersFromEnv().Get("Referer"); got != defaultSourceReferer {
+		t.Errorf("default referer = %q", got)
+	}
+}
