@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/url"
@@ -12,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 /* -------------------- small utils -------------------- */
@@ -214,4 +218,36 @@ func logJSON(v any) {
 		return
 	}
 	log.Print(string(data))
+}
+
+// m3u8ErrorsRecheck is how long jobs are claimed without m3u8_errors after the column turned out to be missing.
+const m3u8ErrorsRecheck = 5 * time.Minute
+
+// claimSelectSQL picks the next job. New jobs go first, and among them the ones the player found without a manifest in
+// the storage (m3u8_errors, the most first); failed jobs follow, the least attempted first.
+func claimSelectSQL(withM3u8Errors bool) string {
+	if withM3u8Errors {
+		return `
+SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json, m3u8_errors
+FROM files_storage
+WHERE status IN ('new','failed')
+  AND attempts < 10
+ORDER BY (status='failed'), CASE WHEN status='new' THEN m3u8_errors ELSE 0 END DESC, attempts, file_id
+LIMIT 1
+	FOR UPDATE SKIP LOCKED`
+	}
+	return `
+SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json
+FROM files_storage
+WHERE status IN ('new','failed')
+  AND attempts < 10
+ORDER BY (status='failed'), attempts, file_id
+LIMIT 1
+	FOR UPDATE SKIP LOCKED`
+}
+
+// isUnknownColumn reports MySQL error 1054 (a column of the query does not exist).
+func isUnknownColumn(err error) bool {
+	var me *mysqldriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1054
 }

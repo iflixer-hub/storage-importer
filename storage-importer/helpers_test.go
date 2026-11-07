@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
 )
 
 func TestQualityAllowed(t *testing.T) {
@@ -224,5 +226,30 @@ func TestBrowserHeadersFromEnv(t *testing.T) {
 	t.Setenv("SOURCE_REFERER", "")
 	if got := browserHeadersFromEnv().Get("Referer"); got != defaultSourceReferer {
 		t.Errorf("default referer = %q", got)
+	}
+}
+
+func TestClaimSelectSQL(t *testing.T) {
+	with := claimSelectSQL(true)
+	for _, want := range []string{"m3u8_errors", "CASE WHEN status='new' THEN m3u8_errors ELSE 0 END DESC", "FOR UPDATE SKIP LOCKED"} {
+		if !strings.Contains(with, want) {
+			t.Errorf("%q missing in\n%s", want, with)
+		}
+	}
+	// new jobs still go before failed ones, the error count only orders inside the new group
+	if strings.Index(with, "ORDER BY (status='failed')") < 0 || strings.Index(with, "(status='failed')") > strings.Index(with, "m3u8_errors ELSE") {
+		t.Errorf("status order must come first:\n%s", with)
+	}
+	if strings.Contains(claimSelectSQL(false), "m3u8_errors") {
+		t.Error("the fallback query must not mention the column")
+	}
+}
+
+func TestIsUnknownColumn(t *testing.T) {
+	if !isUnknownColumn(&mysqldriver.MySQLError{Number: 1054, Message: "Unknown column 'm3u8_errors' in 'field list'"}) {
+		t.Error("1054 is an unknown column")
+	}
+	if isUnknownColumn(&mysqldriver.MySQLError{Number: 1213}) || isUnknownColumn(nil) || isUnknownColumn(io.EOF) {
+		t.Error("only 1054 counts")
 	}
 }

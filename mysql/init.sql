@@ -1262,6 +1262,9 @@ CREATE TABLE files_storage (
   -- опционально: можно хранить “карту качеств” или сырой master
   qualities_json JSON NULL,
 
+  -- сколько раз player не нашёл master-манифест в хранилище (ему отдают ссылку на него)
+  m3u8_errors INT UNSIGNED NOT NULL DEFAULT 0,
+
   PRIMARY KEY (file_id),
   KEY idx_status_started (status, started_at),
   CONSTRAINT fk_files_storage_file

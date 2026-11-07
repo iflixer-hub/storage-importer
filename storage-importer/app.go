@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -32,6 +33,9 @@ type App struct {
 	// quality labels ("720", "480") that may be imported; nil means all
 	allowedQualities map[string]struct{}
 	metrics          *Metrics
+
+	// unix time until which files_storage.m3u8_errors is treated as missing (0 = it exists or is not checked yet)
+	m3u8ErrorsMissingUntil atomic.Int64
 
 	jobHeartbeatInterval time.Duration
 	jobRecoveryTimeout   time.Duration
@@ -563,19 +567,25 @@ func (a *App) claimJob(ctx context.Context) (Job, bool, error) {
 
 	var j Job
 	var attempts int
+	var m3u8Errors int
 	var qualitiesJSON sql.NullString
-	const claimSelect = `
-SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json
-FROM files_storage
-WHERE status IN ('new','failed')
-  AND attempts < 10
-ORDER BY (status='failed'), attempts, file_id
-LIMIT 1
-	FOR UPDATE SKIP LOCKED`
+	useErrors := time.Now().Unix() >= a.m3u8ErrorsMissingUntil.Load()
+	claimSelect := claimSelectSQL(useErrors)
 	selectStarted := logSQLStart("claimJob.select", claimSelect)
 	row := tx.QueryRowContext(ctx, claimSelect)
-	err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts, &qualitiesJSON)
+	if useErrors {
+		err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts, &qualitiesJSON, &m3u8Errors)
+	} else {
+		err = row.Scan(&j.FileID, &j.SourceMaster, &j.R2Prefix, &j.R2MasterKey, &attempts, &qualitiesJSON)
+	}
 	logSQLFinish("claimJob.select", selectStarted, err)
+	if useErrors && isUnknownColumn(err) {
+		// the m3u8_errors migration is not applied yet: claim in the old order and look again later
+		a.m3u8ErrorsMissingUntil.Store(time.Now().Add(m3u8ErrorsRecheck).Unix())
+		log.Printf("[claim] files_storage.m3u8_errors does not exist yet, jobs are claimed without it for %s", m3u8ErrorsRecheck)
+		_ = tx.Rollback()
+		return a.claimJob(ctx)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		commitStarted := logSQLStart("claimJob.commit-empty", "COMMIT")
 		commitErr := tx.Commit()
@@ -609,7 +619,7 @@ SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
 		return Job{}, false, err
 	}
 	a.metrics.jobsTotal.WithLabelValues("claimed").Inc()
-	log.Printf("[claim] file_id=%d attempt=%d r2_prefix=%s master_key=%s", j.FileID, j.AttemptNumber, j.R2Prefix, j.R2MasterKey)
+	log.Printf("[claim] file_id=%d attempt=%d m3u8_errors=%d r2_prefix=%s master_key=%s", j.FileID, j.AttemptNumber, m3u8Errors, j.R2Prefix, j.R2MasterKey)
 	return j, true, nil
 }
 
