@@ -63,10 +63,12 @@ func TestParseProxyList(t *testing.T) {
 }
 
 func TestProxyForRequest(t *testing.T) {
-	t.Setenv("HTTPS_PROXY", "http://warp:1080")
 	req, _ := http.NewRequest("GET", "https://ashdi.vip/x", nil)
-	if u, _ := proxyForRequest(req); u == nil || u.Host != "warp:1080" {
-		t.Errorf("without a pinned proxy the environment proxy is expected, got %v", u)
+	// ProxyFromEnvironment reads the environment once per process, so compare with it instead of setting variables
+	got, _ := proxyForRequest(req)
+	want, _ := http.ProxyFromEnvironment(req)
+	if (got == nil) != (want == nil) || (got != nil && got.String() != want.String()) {
+		t.Errorf("without a pinned proxy the environment proxy is expected: got %v, want %v", got, want)
 	}
 	pinned, _ := url.Parse("http://u:p@isp.decodo.com:10004")
 	req = req.WithContext(withSourceProxy(req.Context(), pinned))

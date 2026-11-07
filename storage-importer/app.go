@@ -94,7 +94,9 @@ func logSQLFinish(op string, started time.Time, err error) {
 
 /* -------------------- rewrite + download/upload -------------------- */
 
-func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL string, media Media) (Media, int, string) {
+// rewriteAndStoreMedia mirrors every resource of a media playlist. A 404 of the source stops it at once and is returned
+// as the last value: the resource is gone, so the rest of the file is not worth downloading.
+func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL string, media Media) (Media, int, string, error) {
 	// все URI строки: сегменты / init / key и т.д.
 	// сделаем:
 	// - сегменты нумеруем 1.ts..N.ts
@@ -124,6 +126,9 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 				newTag, err := a.rewriteURIInsideTag(ctx, j, quality, baseURL, l.Tag)
 				if err != nil {
 					failedURI := resolveURL(baseURL, extractURIFromTag(l.Tag))
+					if isSourceNotFound(err) {
+						return rewritten, successfulSegments, failedURI, err
+					}
 					setFirstFailedURL(&firstFailedURL, failedURI)
 					log.Printf("[job %d] partial: rewrite tag failed quality=%s url=%s err=%v", j.FileID, quality, failedURI, err)
 					rewritten.Lines = append(rewritten.Lines, l)
@@ -145,6 +150,9 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 			dstKey := fmt.Sprintf("%s/%s/%s", j.R2Prefix, quality, dstName)
 
 			if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+				if isSourceNotFound(err) {
+					return rewritten, successfulSegments, abs, err
+				}
 				setFirstFailedURL(&firstFailedURL, abs)
 				log.Printf("[job %d] partial: segment mirror failed quality=%s url=%s err=%v", j.FileID, quality, abs, err)
 				continue
@@ -161,6 +169,9 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 			}
 			dstKey := fmt.Sprintf("%s/%s/%s", j.R2Prefix, quality, base)
 			if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+				if isSourceNotFound(err) {
+					return rewritten, successfulSegments, abs, err
+				}
 				setFirstFailedURL(&firstFailedURL, abs)
 				log.Printf("[job %d] partial: asset mirror failed quality=%s url=%s err=%v", j.FileID, quality, abs, err)
 				continue
@@ -169,7 +180,7 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 		}
 	}
 
-	return rewritten, successfulSegments, firstFailedURL
+	return rewritten, successfulSegments, firstFailedURL, nil
 }
 
 func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, tagLine string) (string, error) {
@@ -235,7 +246,7 @@ func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("GET %s status=%d body=%q", srcURL, resp.StatusCode, string(body))
+		return &sourceStatusError{URL: srcURL, Status: resp.StatusCode, Body: sourceBodySnippet(body)}
 	}
 
 	ct := resp.Header.Get("Content-Type")
@@ -270,10 +281,17 @@ func (a *App) mirrorBinary(ctx context.Context, srcURL, dstKey string) error {
 /* -------------------- DB status helpers -------------------- */
 
 func (a *App) markFailed(ctx context.Context, job Job, err error) error {
-	const q = `
+	q := `
 UPDATE files_storage
 SET status='failed', last_error=?, finished_at=NOW()
 	WHERE file_id=? AND status='in_progress' AND attempts=?`
+	if isPermanentError(err) {
+		// a retry would hit the same missing file: use up the attempts so that the job is not claimed again
+		q = fmt.Sprintf(`
+UPDATE files_storage
+SET status='failed', last_error=?, finished_at=NOW(), attempts=GREATEST(attempts, %d)
+	WHERE file_id=? AND status='in_progress' AND attempts=?`, maxJobAttempts)
+	}
 	started := logSQLStart("markFailed", q, truncate(err.Error(), 4000), job.FileID, job.AttemptNumber)
 	result, e := a.db.ExecContext(ctx, q, truncate(err.Error(), 4000), job.FileID, job.AttemptNumber)
 	logSQLFinish("markFailed", started, e)
@@ -377,7 +395,7 @@ func (a *App) fetchText(ctx context.Context, rawURL string) ([]byte, string, err
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, "", fmt.Errorf("GET %s status=%d body=%q", rawURL, resp.StatusCode, string(body))
+		return nil, "", &sourceStatusError{URL: rawURL, Status: resp.StatusCode, Body: sourceBodySnippet(body)}
 	}
 
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
@@ -631,6 +649,9 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
 	if err != nil {
+		if isSourceNotFound(err) {
+			return processResult{}, &permanentError{fmt.Errorf("fetch master: %w", err)}
+		}
 		return processResult{}, fmt.Errorf("fetch master: %w", err)
 	}
 
@@ -696,6 +717,10 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		variantAbs := resolveURL(masterURL, v.URI)
 		variantBytes, variantURL, err := a.fetchText(ctx, variantAbs)
 		if err != nil {
+			if isSourceNotFound(err) {
+				a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
+				return processResult{}, &permanentError{fmt.Errorf("source file is gone: playlist of quality=%s: %w", quality, err)}
+			}
 			log.Printf("[job %d] partial: fetch variant failed url=%s err=%v", j.FileID, variantAbs, err)
 			setFirstFailedURL(&firstFailedURL, variantAbs)
 			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
@@ -715,7 +740,11 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 
 		// качаем/заливаем все “ресурсные URI” плейлиста (сегменты, init.mp4, key и т.п.)
 		// и переписываем плейлист на относительные пути с нумерацией ts.
-		rewrittenMedia, successfulSegments, mediaFirstFailedURL := a.rewriteAndStoreMedia(ctx, j, quality, variantURL, media)
+		rewrittenMedia, successfulSegments, mediaFirstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, variantURL, media)
+		if goneErr != nil {
+			a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
+			return processResult{}, &permanentError{fmt.Errorf("source file is gone: quality=%s: %w", quality, goneErr)}
+		}
 		setFirstFailedURL(&firstFailedURL, mediaFirstFailedURL)
 		if successfulSegments == 0 {
 			log.Printf("[job %d] partial: no successful chunks for quality=%s variant=%s", j.FileID, quality, variantAbs)
@@ -816,7 +845,11 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 	}
 	log.Printf("[job %d] processing single playlist quality=%s", j.FileID, quality)
 
-	rewrittenMedia, successfulSegments, firstFailedURL := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media)
+	rewrittenMedia, successfulSegments, firstFailedURL, goneErr := a.rewriteAndStoreMedia(ctx, j, quality, baseURL, media)
+	if goneErr != nil {
+		a.metrics.qualitiesTotal.WithLabelValues("failed").Inc()
+		return processResult{}, &permanentError{fmt.Errorf("source file is gone: %w", goneErr)}
+	}
 	if successfulSegments == 0 {
 		if firstFailedURL != "" {
 			return processResult{}, fmt.Errorf("no chunks imported successfully, first failed url=%s", firstFailedURL)

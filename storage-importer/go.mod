@@ -1,4 +1,4 @@
-module main
+module storage-importer
 
 go 1.23.2
 

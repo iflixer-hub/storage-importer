@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"sort"
@@ -227,27 +229,63 @@ const m3u8ErrorsRecheck = 5 * time.Minute
 // the storage (m3u8_errors, the most first); failed jobs follow, the least attempted first.
 func claimSelectSQL(withM3u8Errors bool) string {
 	if withM3u8Errors {
-		return `
+		return fmt.Sprintf(`
 SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json, m3u8_errors
 FROM files_storage
 WHERE status IN ('new','failed')
-  AND attempts < 10
+  AND attempts < %d
 ORDER BY (status='failed'), CASE WHEN status='new' THEN m3u8_errors ELSE 0 END DESC, attempts, file_id
 LIMIT 1
-	FOR UPDATE SKIP LOCKED`
+	FOR UPDATE SKIP LOCKED`, maxJobAttempts)
 	}
-	return `
+	return fmt.Sprintf(`
 SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities_json
 FROM files_storage
 WHERE status IN ('new','failed')
-  AND attempts < 10
+  AND attempts < %d
 ORDER BY (status='failed'), attempts, file_id
 LIMIT 1
-	FOR UPDATE SKIP LOCKED`
+	FOR UPDATE SKIP LOCKED`, maxJobAttempts)
 }
 
 // isUnknownColumn reports MySQL error 1054 (a column of the query does not exist).
 func isUnknownColumn(err error) bool {
 	var me *mysqldriver.MySQLError
 	return errors.As(err, &me) && me.Number == 1054
+}
+
+// maxJobAttempts is how many times a job is tried; a failed job with this many attempts is dead and never claimed.
+const maxJobAttempts = 10
+
+// sourceStatusError is a non-2xx answer of the source.
+type sourceStatusError struct {
+	URL    string
+	Status int
+	Body   string
+}
+
+func (e *sourceStatusError) Error() string {
+	return fmt.Sprintf("GET %s status=%d body=%q", e.URL, e.Status, e.Body)
+}
+
+// sourceBodySnippet keeps the start of an error page (they are padded to kilobytes) on one line.
+func sourceBodySnippet(body []byte) string {
+	return truncate(strings.Join(strings.Fields(string(body)), " "), 200)
+}
+
+// isSourceNotFound reports a 404 from the source: the file (a segment, a playlist, a key) is gone there.
+func isSourceNotFound(err error) bool {
+	var se *sourceStatusError
+	return errors.As(err, &se) && se.Status == http.StatusNotFound
+}
+
+// permanentError marks a failure that a retry cannot fix: the job is failed for good (attempts are used up).
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return "permanent: " + e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+func isPermanentError(err error) bool {
+	var pe *permanentError
+	return errors.As(err, &pe)
 }

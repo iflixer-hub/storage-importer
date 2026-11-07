@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"time"
 )
@@ -33,16 +34,16 @@ func startDBStatsLoop(ctx context.Context, db *sql.DB, m *Metrics, every time.Du
 
 	// дернуть сразу, чтобы метрики появились без ожидания
 	updateOnce := func() {
-		const q = `
+		q := fmt.Sprintf(`
 SELECT
   COUNT(*) AS total,
   SUM(status='done') AS done,
   SUM(status='in_progress') AS running,
   SUM(status='failed') AS failed,
   SUM(status='new') AS new_jobs,
-  SUM(status='done' AND last_error LIKE 'partial%') AS partial,
-  SUM(status='failed' AND attempts >= 10) AS dead
-FROM files_storage;`
+  SUM(status='done' AND last_error LIKE 'partial%%') AS partial,
+  SUM(status='failed' AND attempts >= %d) AS dead
+FROM files_storage;`, maxJobAttempts)
 		var total, done, running, failed, newJobs, partial, dead sql.NullInt64
 		if err := db.QueryRowContext(ctx, q).Scan(&total, &done, &running, &failed, &newJobs, &partial, &dead); err != nil {
 			if mysqlLogErrors {
