@@ -160,3 +160,12 @@ func TestThrottleCallbacks(t *testing.T) {
 		t.Errorf("limited=%d waited=%v", limited, waited)
 	}
 }
+
+func TestProxyPoolSettingName(t *testing.T) {
+	if got := newProxyPool(nil, time.Minute, "").setting; got != "ashdi_proxies" {
+		t.Errorf("default setting = %q", got)
+	}
+	if got := newProxyPool(nil, time.Minute, "  luxhost_proxies ").setting; got != "luxhost_proxies" {
+		t.Errorf("custom setting = %q", got)
+	}
+}

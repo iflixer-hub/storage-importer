@@ -99,7 +99,7 @@ func main() {
 	app := &App{
 		db:         db,
 		httpClient: httpClient,
-		proxies:    newProxyPool(db, proxyListTTL),
+		proxies:    newProxyPool(db, proxyListTTL, os.Getenv("SOURCE_PROXIES_SETTING")),
 		s3:         s3c,
 		uploader:   manager.NewUploader(s3c),
 
@@ -125,6 +125,7 @@ func main() {
 
 	go serveMetrics(envString("METRICS_ADDR", ":9090"))
 
+	log.Printf("source proxies: settings row %q", app.proxies.setting)
 	log.Printf("start: sourceDelayMs=%d source429Retries=%d allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", envInt("SOURCE_REQUEST_DELAY_MS", 0), envInt("SOURCE_429_RETRIES", 3), sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	ctx := context.Background()

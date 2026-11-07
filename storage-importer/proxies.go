@@ -13,11 +13,12 @@ import (
 	"time"
 )
 
-// ashdiProxiesSetting is the same `settings` row flixhub-mono reads for its ashdi requests:
-// a JSON list like ["http://user:pass@host:10004", ...].
+// The proxies come from a row of the `settings` table, a JSON list like ["http://user:pass@host:10004", ...].
+// ashdi_proxies is the row flixhub-mono reads for its ashdi requests; SOURCE_PROXIES_SETTING picks another one
+// (for example luxhost_proxies).
 const (
-	ashdiProxiesSetting = "ashdi_proxies"
-	proxyListTTL        = 10 * time.Minute
+	defaultProxiesSetting = "ashdi_proxies"
+	proxyListTTL          = 10 * time.Minute
 )
 
 type proxyCtxKey struct{}
@@ -25,8 +26,9 @@ type proxyCtxKey struct{}
 // proxyPool hands out the proxies from the settings table round-robin. The list is cached,
 // and the previous one is kept when the database cannot be read.
 type proxyPool struct {
-	db  *sql.DB
-	ttl time.Duration
+	db      *sql.DB
+	ttl     time.Duration
+	setting string // name of the settings row
 
 	mu       sync.Mutex
 	list     []*url.URL
@@ -35,8 +37,12 @@ type proxyPool struct {
 	rr atomic.Uint64
 }
 
-func newProxyPool(db *sql.DB, ttl time.Duration) *proxyPool {
-	return &proxyPool{db: db, ttl: ttl}
+func newProxyPool(db *sql.DB, ttl time.Duration, setting string) *proxyPool {
+	setting = strings.TrimSpace(setting)
+	if setting == "" {
+		setting = defaultProxiesSetting
+	}
+	return &proxyPool{db: db, ttl: ttl, setting: setting}
 }
 
 func parseProxyList(raw string) []*url.URL {
@@ -63,7 +69,7 @@ func (p *proxyPool) refresh(ctx context.Context) []*url.URL {
 	}
 
 	var raw sql.NullString
-	err := p.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE name=? LIMIT 1", ashdiProxiesSetting).Scan(&raw)
+	err := p.db.QueryRowContext(ctx, "SELECT value FROM settings WHERE name=? LIMIT 1", p.setting).Scan(&raw)
 	switch {
 	case err == nil:
 		p.list = parseProxyList(raw.String)
@@ -71,14 +77,14 @@ func (p *proxyPool) refresh(ctx context.Context) []*url.URL {
 		p.list = nil
 	default:
 		// keep what we had, but retry sooner than a full ttl
-		log.Printf("[proxy] cannot read setting %s: %v", ashdiProxiesSetting, err)
+		log.Printf("[proxy] cannot read setting %s: %v", p.setting, err)
 		if p.loadedAt.IsZero() {
 			p.loadedAt = time.Now().Add(-p.ttl + 30*time.Second)
 		}
 		return p.list
 	}
 	p.loadedAt = time.Now()
-	log.Printf("[proxy] %s: %d proxies", ashdiProxiesSetting, len(p.list))
+	log.Printf("[proxy] %s: %d proxies", p.setting, len(p.list))
 	return p.list
 }
 
