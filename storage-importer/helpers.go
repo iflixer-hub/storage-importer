@@ -234,7 +234,7 @@ SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities
 FROM files_storage
 WHERE status IN ('new','failed')
   AND attempts < %d
-ORDER BY (status='failed'), CASE WHEN status='new' THEN m3u8_errors ELSE 0 END DESC, attempts, file_id
+ORDER BY (status='failed'), CASE WHEN status='new' THEN m3u8_errors ELSE 0 END DESC, attempts, created_at DESC
 LIMIT 1
 	FOR UPDATE SKIP LOCKED`, maxJobAttempts)
 	}
@@ -243,7 +243,7 @@ SELECT file_id, source_master_url, r2_prefix, r2_master_key, attempts, qualities
 FROM files_storage
 WHERE status IN ('new','failed')
   AND attempts < %d
-ORDER BY (status='failed'), attempts, file_id
+ORDER BY (status='failed'), attempts, created_at DESC
 LIMIT 1
 	FOR UPDATE SKIP LOCKED`, maxJobAttempts)
 }
