@@ -28,12 +28,13 @@ type Metrics struct {
 
 	lastSuccessTs prometheus.Gauge
 
-	qualitiesTotal     *prometheus.CounterVec
-	proxyJobs          *prometheus.CounterVec
-	sourceRateLimited  *prometheus.CounterVec
-	sourceThrottleWait *prometheus.CounterVec
-	s3Errors           *prometheus.CounterVec
-	objectsReused      prometheus.Counter
+	qualitiesTotal      *prometheus.CounterVec
+	proxyJobs           *prometheus.CounterVec
+	sourceRateLimited   *prometheus.CounterVec
+	sourceThrottleWait  *prometheus.CounterVec
+	s3Errors            *prometheus.CounterVec
+	objectsReused       prometheus.Counter
+	tailSegmentsSkipped prometheus.Counter
 
 	dbJobsTotal   prometheus.Gauge
 	dbJobsDone    prometheus.Gauge
@@ -115,6 +116,9 @@ func NewMetrics() *Metrics {
 		objectsReused: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "import_objects_reused_total", Help: "Chunks and other objects found in the storage and not downloaded again",
 		}),
+		tailSegmentsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "import_tail_segments_skipped_total", Help: "Chunks at the end of a source that could not be downloaded and were left out (the file still counts as imported)",
+		}),
 		s3Errors: prometheus.NewCounterVec(
 			prometheus.CounterOpts{Name: "import_s3_errors_total", Help: "Failed uploads to the storage by kind (playlist, object)"},
 			[]string{"op"},
@@ -137,7 +141,7 @@ func NewMetrics() *Metrics {
 		m.lastSuccessTs,
 		m.dbJobsTotal, m.dbJobsDone, m.dbJobsRunning, m.dbJobsFailed,
 		m.dbJobsNew, m.dbJobsPartial, m.dbJobsDead,
-		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors, m.objectsReused,
+		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors, m.objectsReused, m.tailSegmentsSkipped,
 	)
 	return m
 }

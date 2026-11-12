@@ -108,6 +108,7 @@ func main() {
 		clearFiles: clearFiles,
 
 		allowedQualities: allowedQualities,
+		tailTolerance:    envInt("TAIL_SEGMENTS_TOLERANCE", 30),
 		workers:          workers,
 
 		jobHeartbeatInterval: jobHeartbeatInterval,

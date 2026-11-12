@@ -32,7 +32,9 @@ type App struct {
 	workers    int
 	// quality labels ("720", "480") that may be imported; nil means all
 	allowedQualities map[string]struct{}
-	metrics          *Metrics
+	// chunks at the end of a source (the last N) whose failure does not fail the file; 0 turns it off
+	tailTolerance int
+	metrics       *Metrics
 
 	// unix time until which files_storage.m3u8_errors is treated as missing (0 = it exists or is not checked yet)
 	m3u8ErrorsMissingUntil atomic.Int64
@@ -154,6 +156,13 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 				// stored by an earlier attempt (an object appears in the storage only when it is complete)
 				a.metrics.objectsReused.Inc()
 			} else if err := a.mirrorBinary(ctx, abs, dstKey); err != nil {
+				// the last chunks of a source are often broken or missing; the video is complete without them
+				if ctx.Err() == nil && inTailWindow(segIndex, totalSeg, a.tailTolerance) {
+					rewritten.Lines = dropSegmentTags(rewritten.Lines)
+					a.metrics.tailSegmentsSkipped.Inc()
+					log.Printf("[job %d] tail chunk %d/%d skipped quality=%s url=%s err=%v", j.FileID, segIndex, totalSeg, quality, abs, err)
+					continue
+				}
 				if isSourceNotFound(err) {
 					return rewritten, successfulSegments, abs, err
 				}
@@ -187,6 +196,32 @@ func (a *App) rewriteAndStoreMedia(ctx context.Context, j Job, quality, baseURL 
 	}
 
 	return rewritten, successfulSegments, firstFailedURL, nil
+}
+
+// inTailWindow tells whether segment number idx (1-based) of total is among the last `tolerance` ones. The window is
+// never more than half of the file, so a short file with a broken chunk in the middle still fails.
+func inTailWindow(idx, total, tolerance int) bool {
+	if tolerance <= 0 || total <= 0 {
+		return false
+	}
+	window := tolerance
+	if half := total / 2; window > half {
+		window = half
+	}
+	return idx > total-window
+}
+
+// dropSegmentTags removes the tags of the segment that was just left out of a playlist (its #EXTINF and the like),
+// which stand right before its URI line; without this the next URI would take over the duration of the dropped one.
+func dropSegmentTags(lines []MediaLine) []MediaLine {
+	for len(lines) > 0 {
+		last := lines[len(lines)-1]
+		if !last.IsTag || !(strings.HasPrefix(last.Tag, "#EXTINF") || strings.HasPrefix(last.Tag, "#EXT-X-BYTERANGE") || strings.HasPrefix(last.Tag, "#EXT-X-PROGRAM-DATE-TIME")) {
+			break
+		}
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func (a *App) rewriteURIInsideTag(ctx context.Context, j Job, quality, baseURL, tagLine string, have map[string]bool) (string, error) {
