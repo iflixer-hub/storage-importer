@@ -30,6 +30,7 @@ type Metrics struct {
 
 	qualitiesTotal         *prometheus.CounterVec
 	proxyJobs              *prometheus.CounterVec
+	proxyLeaseFallback     prometheus.Counter
 	sourceRateLimited      *prometheus.CounterVec
 	sourceForbiddenRetries *prometheus.CounterVec
 	sourceThrottleWait     *prometheus.CounterVec
@@ -102,6 +103,7 @@ func NewMetrics() *Metrics {
 			prometheus.CounterOpts{Name: "import_qualities_total", Help: "Qualities by result: imported, partial (some chunks failed), failed, kept (already imported), skipped (not in ALLOWED_QUALITIES)"},
 			[]string{"result"},
 		),
+		proxyLeaseFallback: prometheus.NewCounter(prometheus.CounterOpts{Name: "import_proxy_lease_fallback_total", Help: "Jobs that took a shared proxy because every proxy was leased"}),
 		proxyJobs: prometheus.NewCounterVec(
 			prometheus.CounterOpts{Name: "import_proxy_jobs_total", Help: "Jobs started per source proxy (host:port, \"env\" when the environment proxy is used)"},
 			[]string{"proxy"},
@@ -146,7 +148,7 @@ func NewMetrics() *Metrics {
 		m.lastSuccessTs,
 		m.dbJobsTotal, m.dbJobsDone, m.dbJobsRunning, m.dbJobsFailed,
 		m.dbJobsNew, m.dbJobsPartial, m.dbJobsDead,
-		m.qualitiesTotal, m.proxyJobs, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors, m.objectsReused, m.sourceForbiddenRetries, m.tailSegmentsSkipped,
+		m.qualitiesTotal, m.proxyJobs, m.proxyLeaseFallback, m.sourceRateLimited, m.sourceThrottleWait, m.s3Errors, m.objectsReused, m.sourceForbiddenRetries, m.tailSegmentsSkipped,
 	)
 	return m
 }

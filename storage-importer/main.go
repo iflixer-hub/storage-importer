@@ -137,6 +137,9 @@ func main() {
 	log.Printf("start: sourceDelayMs=%d source429Retries=%d allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", envInt("SOURCE_REQUEST_DELAY_MS", 0), envInt("SOURCE_429_RETRIES", 3), sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
 	// SIGTERM (a deploy, a restart): the jobs in work go back to the queue instead of failing with "worker lease expired"
+	app.proxies.leaseTTL = time.Duration(envInt("PROXY_LEASE_SECONDS", 300)) * time.Second
+	app.proxies.leaseWait = time.Duration(envInt("PROXY_LEASE_WAIT_SECONDS", 120)) * time.Second
+	app.proxies.onFallback = func() { metrics.proxyLeaseFallback.Inc() }
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go app.recoveryLoop(ctx)

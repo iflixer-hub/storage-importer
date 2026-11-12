@@ -732,7 +732,8 @@ SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
 }
 
 func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
-	proxy := a.proxies.next(ctx)
+	proxy, releaseProxy := a.proxies.acquire(ctx, proxyLeaseOwner(j.FileID, j.AttemptNumber))
+	defer releaseProxy()
 	ctx = withSourceProxy(ctx, proxy)
 	a.metrics.proxyJobs.WithLabelValues(proxyEndpoint(proxy)).Inc()
 	log.Printf("[job %d] source proxy=%s", j.FileID, proxyEndpoint(proxy))
