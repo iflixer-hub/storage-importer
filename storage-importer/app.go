@@ -837,7 +837,14 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 		log.Printf("[job %d] skipped qualities not in ALLOWED_QUALITIES: %s", j.FileID, strings.Join(skippedQualities, ","))
 	}
 	if attempted == 0 && keptQualities == 0 {
-		return processResult{}, fmt.Errorf("no variant matches ALLOWED_QUALITIES, source has: %s", strings.Join(skippedQualities, ","))
+		// the master as the source gave it: a master that differs from what a browser gets (another proxy, geo,
+		// a throttled answer) shows here
+		described := make([]string, 0, len(master.Variants))
+		for _, v := range master.Variants {
+			described = append(described, strings.TrimSpace(v.StreamInfLine)+" -> "+v.URI)
+		}
+		return processResult{}, fmt.Errorf("no variant matches ALLOWED_QUALITIES, source has: %s; master %s: %s",
+			strings.Join(skippedQualities, ","), masterURL, strings.Join(described, " | "))
 	}
 	if attempted > 0 {
 		if playlistsFetched == 0 {
