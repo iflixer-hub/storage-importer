@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	dto "github.com/prometheus/client_model/go"
 	"io"
 	"net/http"
@@ -201,5 +202,31 @@ func TestUsableSkipsExcludedAndPenalized(t *testing.T) {
 	// everything excluded: the whole list
 	if got = p.usable([]*url.URL{a}, []string{"a:1"}); len(got) != 1 {
 		t.Fatalf("got %v", got)
+	}
+}
+
+func TestRetryOnDeadlock(t *testing.T) {
+	deadlock := &mysqldriver.MySQLError{Number: 1213, Message: "Deadlock"}
+	calls := 0
+	err := retryOnDeadlock(context.Background(), func() error {
+		calls++
+		if calls < 3 {
+			return deadlock
+		}
+		return nil
+	})
+	if err != nil || calls != 3 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+
+	calls = 0
+	if err := retryOnDeadlock(context.Background(), func() error { calls++; return deadlock }); !isDeadlock(err) || calls != 3 {
+		t.Fatalf("a deadlock that stays is returned after 3 tries: err=%v calls=%d", err, calls)
+	}
+
+	calls = 0
+	other := io.EOF
+	if err := retryOnDeadlock(context.Background(), func() error { calls++; return other }); err != other || calls != 1 {
+		t.Fatalf("other errors are not retried: err=%v calls=%d", err, calls)
 	}
 }

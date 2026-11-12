@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"path"
 	"strconv"
@@ -595,16 +596,36 @@ WHERE file_id=? AND status='in_progress' AND attempts=?`, job.FileID, job.Attemp
 	}
 }
 
+// retryOnDeadlock runs fn again (up to 3 tries, with a short random pause) when MySQL aborts it as a deadlock victim.
+// Every instance of the importer runs the recovery at the same minute, and it meets the heartbeats and claims of the
+// jobs on the same rows.
+func retryOnDeadlock(ctx context.Context, fn func() error) error {
+	var err error
+	for try := 0; try < 3; try++ {
+		if err = fn(); !isDeadlock(err) {
+			return err
+		}
+		sleepCtx(ctx, time.Duration(100+rand.Intn(700))*time.Millisecond)
+	}
+	return err
+}
+
 func (a *App) recoverStaleJobs(ctx context.Context) error {
-	result, err := a.db.ExecContext(ctx, `
+	var affected int64
+	err := retryOnDeadlock(ctx, func() error {
+		// ordered by the key: concurrent recoveries lock the rows in the same order and do not wait for each other in a circle
+		result, err := a.db.ExecContext(ctx, `
 UPDATE files_storage
 SET status='failed', finished_at=NOW(), last_error='worker lease expired'
 WHERE status='in_progress'
-  AND started_at < DATE_SUB(NOW(), INTERVAL ? SECOND)`, int64(a.jobRecoveryTimeout/time.Second))
-	if err != nil {
+  AND started_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
+ORDER BY file_id`, int64(a.jobRecoveryTimeout/time.Second))
+		if err != nil {
+			return err
+		}
+		affected, err = result.RowsAffected()
 		return err
-	}
-	affected, err := result.RowsAffected()
+	})
 	if err != nil {
 		return err
 	}
@@ -620,6 +641,8 @@ func (a *App) recoveryLoop(ctx context.Context) {
 			log.Printf("[recovery] error: %v", err)
 		}
 	}
+	// the instances start together after a deploy: spread their recoveries so that they do not run in the same second
+	sleepCtx(ctx, time.Duration(rand.Int63n(int64(a.jobRecoveryInterval))))
 	recover()
 	ticker := time.NewTicker(a.jobRecoveryInterval)
 	defer ticker.Stop()
