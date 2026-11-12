@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	dto "github.com/prometheus/client_model/go"
+	"io"
+	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -110,5 +114,92 @@ func TestSleepCtxStopsOnCancel(t *testing.T) {
 	sleepCtx(ctx, time.Minute)
 	if time.Since(start) > time.Second {
 		t.Error("a cancelled context must end the sleep at once")
+	}
+}
+
+type proxyAwareRT struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	used []string
+	bad  string
+}
+
+func (r *proxyAwareRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := ""
+	if u, ok := req.Context().Value(proxyCtxKey{}).(*url.URL); ok && u != nil {
+		host = u.Host
+	}
+	if strings.HasSuffix(req.URL.Path, "master.m3u8") {
+		r.mu.Lock()
+		r.used = append(r.used, host)
+		r.mu.Unlock()
+		if host == r.bad {
+			return &http.Response{StatusCode: 403, Body: io.NopCloser(strings.NewReader("forbidden")), Header: http.Header{}, Request: req}, nil
+		}
+	}
+	return r.base.RoundTrip(req)
+}
+
+func TestMasterForbiddenSwitchesToAnotherProxy(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+	rt := &proxyAwareRT{base: f.app.httpClient.Transport, bad: "bad.example:1"}
+	if rt.base == nil {
+		rt.base = http.DefaultTransport
+	}
+	f.app.httpClient = &http.Client{Transport: rt}
+	f.app.masterProxySwitches = 3
+	f.app.proxies.list = []*url.URL{{Scheme: "http", Host: "bad.example:1"}, {Scheme: "http", Host: "good.example:1"}}
+
+	if _, err := f.app.processJob(context.Background(), Job{FileID: 5, SourceMaster: f.srcURL + "/m/master.m3u8", R2Prefix: "files/5", R2MasterKey: "files/5/index.m3u8"}); err != nil {
+		t.Fatalf("the job must succeed through the second proxy: %v", err)
+	}
+	if len(rt.used) != 2 || rt.used[0] != "bad.example:1" || rt.used[1] != "good.example:1" {
+		t.Fatalf("proxies used for the master: %v", rt.used)
+	}
+
+	// the refused proxy is passed over by the next jobs
+	rt.used = nil
+	if _, err := f.app.processJob(context.Background(), Job{FileID: 6, SourceMaster: f.srcURL + "/m/master.m3u8", R2Prefix: "files/6", R2MasterKey: "files/6/index.m3u8"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.used) != 1 || rt.used[0] != "good.example:1" {
+		t.Fatalf("a penalized proxy must be skipped: %v", rt.used)
+	}
+}
+
+func TestMasterForbiddenEverywhereStillFails(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+	rt := &proxyAwareRT{base: http.DefaultTransport, bad: "bad.example:1"}
+	f.app.httpClient = &http.Client{Transport: rt}
+	f.app.masterProxySwitches = 3
+	f.app.proxies.list = []*url.URL{{Scheme: "http", Host: "bad.example:1"}}
+
+	_, err := f.app.processJob(context.Background(), Job{FileID: 5, SourceMaster: f.srcURL + "/m/master.m3u8"})
+	if err == nil || !isSourceForbidden(err) {
+		t.Fatalf("expected a 403 failure, got %v", err)
+	}
+	if len(rt.used) > 4 {
+		t.Errorf("the switches are limited: %d attempts", len(rt.used))
+	}
+}
+
+func TestUsableSkipsExcludedAndPenalized(t *testing.T) {
+	a, b, c := &url.URL{Host: "a:1"}, &url.URL{Host: "b:1"}, &url.URL{Host: "c:1"}
+	p := &proxyPool{}
+	p.penalize(b)
+	got := p.usable([]*url.URL{a, b, c}, []string{"a:1"})
+	if len(got) != 1 || got[0].Host != "c:1" {
+		t.Fatalf("got %v", got)
+	}
+	// nothing clean left: the job's own exclusions still hold, the penalty gives way
+	got = p.usable([]*url.URL{a, b}, []string{"a:1"})
+	if len(got) != 1 || got[0].Host != "b:1" {
+		t.Fatalf("got %v", got)
+	}
+	// everything excluded: the whole list
+	if got = p.usable([]*url.URL{a}, []string{"a:1"}); len(got) != 1 {
+		t.Fatalf("got %v", got)
 	}
 }

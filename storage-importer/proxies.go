@@ -52,6 +52,7 @@ type proxyPool struct {
 
 	leaseMu      sync.Mutex
 	leaseRowsFor string // the list whose rows exist in the table
+	penalties    map[string]time.Time
 }
 
 func newProxyPool(db *sql.DB, ttl time.Duration, setting string) *proxyPool {
@@ -140,7 +141,55 @@ func proxyEndpoint(u *url.URL) string {
 	return u.Host
 }
 
-const proxyLeasePoll = 2 * time.Second
+const (
+	proxyLeasePoll = 2 * time.Second
+	// a proxy that got a 403 on a master is passed over for this long
+	proxyPenaltyTTL = 10 * time.Minute
+)
+
+// penalize marks a proxy as bad for a while: jobs take the others first.
+func (p *proxyPool) penalize(u *url.URL) {
+	if u == nil {
+		return
+	}
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	if p.penalties == nil {
+		p.penalties = map[string]time.Time{}
+	}
+	p.penalties[u.Host] = time.Now().Add(proxyPenaltyTTL)
+}
+
+// usable drops the proxies that the job has already failed on (exclude) and those that are penalized. When nothing
+// is left, the whole list is used: a bad proxy is better than no proxy.
+func (p *proxyPool) usable(list []*url.URL, exclude []string) []*url.URL {
+	p.leaseMu.Lock()
+	defer p.leaseMu.Unlock()
+	now := time.Now()
+	skip := make(map[string]bool, len(exclude))
+	for _, h := range exclude {
+		skip[h] = true
+	}
+	res := make([]*url.URL, 0, len(list))
+	for _, u := range list {
+		if skip[u.Host] || now.Before(p.penalties[u.Host]) {
+			continue
+		}
+		res = append(res, u)
+	}
+	if len(res) == 0 {
+		// keep the proxies this job has not failed on, penalized or not
+		for _, u := range list {
+			if !skip[u.Host] {
+				res = append(res, u)
+			}
+		}
+	}
+	if len(res) == 0 {
+		return list
+	}
+	return res
+}
 
 func isNoSuchTable(err error) bool {
 	var me *mysqldriver.MySQLError
@@ -150,11 +199,12 @@ func isNoSuchTable(err error) bool {
 // acquire returns a proxy for a job and the function that gives it back. The proxy that was released the longest
 // ago is taken, so the load is spread over all of them. When every proxy is busy for leaseWait, or the lease table
 // cannot be used, the round-robin choice is used (a proxy may then be shared) and the job is not stopped.
-func (p *proxyPool) acquire(ctx context.Context, owner string) (*url.URL, func()) {
-	list := p.refresh(ctx)
-	if len(list) == 0 {
+func (p *proxyPool) acquire(ctx context.Context, owner string, exclude ...string) (*url.URL, func()) {
+	all := p.refresh(ctx)
+	if len(all) == 0 {
 		return nil, func() {}
 	}
+	list := p.usable(all, exclude)
 	if p.leaseTTL > 0 && time.Now().Unix() >= p.leaseOffUntil.Load() {
 		deadline := time.Now().Add(p.leaseWait)
 		for {
@@ -186,7 +236,7 @@ func (p *proxyPool) acquire(ctx context.Context, owner string) (*url.URL, func()
 			sleepCtx(ctx, proxyLeasePoll)
 		}
 	}
-	return p.next(ctx), func() {}
+	return list[(p.rr.Add(1)-1)%uint64(len(list))], func() {}
 }
 
 // tryLease takes the free proxy that was used the longest ago (nil when all are busy). Rows are created here, so the

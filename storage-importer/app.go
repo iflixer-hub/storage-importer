@@ -34,7 +34,9 @@ type App struct {
 	allowedQualities map[string]struct{}
 	// chunks at the end of a source (the last N) whose failure does not fail the file; 0 turns it off
 	tailTolerance int
-	metrics       *Metrics
+	// other proxies tried when the source answers 403 to the master through the first one
+	masterProxySwitches int
+	metrics             *Metrics
 
 	// unix time until which files_storage.m3u8_errors is treated as missing (0 = it exists or is not checked yet)
 	m3u8ErrorsMissingUntil atomic.Int64
@@ -732,13 +734,28 @@ SET status='in_progress', attempts=attempts+1, started_at=NOW(), last_error=NULL
 }
 
 func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
-	proxy, releaseProxy := a.proxies.acquire(ctx, proxyLeaseOwner(j.FileID, j.AttemptNumber))
-	defer releaseProxy()
-	ctx = withSourceProxy(ctx, proxy)
+	owner := proxyLeaseOwner(j.FileID, j.AttemptNumber)
+	baseCtx := ctx
+	proxy, releaseProxy := a.proxies.acquire(baseCtx, owner)
+	defer func() { releaseProxy() }()
+	ctx = withSourceProxy(baseCtx, proxy)
 	a.metrics.proxyJobs.WithLabelValues(proxyEndpoint(proxy)).Inc()
 	log.Printf("[job %d] source proxy=%s", j.FileID, proxyEndpoint(proxy))
 	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
+	// The source refuses some proxies for a while (403 stays after the retries of the transport): the job takes
+	// another proxy instead of failing, and the refused one is passed over by the next jobs.
+	var failedProxies []string
+	for switches := 0; err != nil && isSourceForbidden(err) && proxy != nil && switches < a.masterProxySwitches && baseCtx.Err() == nil; switches++ {
+		a.proxies.penalize(proxy)
+		failedProxies = append(failedProxies, proxy.Host)
+		a.metrics.proxySwitches.WithLabelValues(proxyEndpoint(proxy)).Inc()
+		releaseProxy()
+		proxy, releaseProxy = a.proxies.acquire(baseCtx, owner, failedProxies...)
+		ctx = withSourceProxy(baseCtx, proxy)
+		log.Printf("[job %d] master refused (403) via %s, trying proxy=%s", j.FileID, failedProxies[len(failedProxies)-1], proxyEndpoint(proxy))
+		masterBytes, masterURL, err = a.fetchText(ctx, j.SourceMaster)
+	}
 	if err != nil {
 		if isSourceNotFound(err) {
 			return processResult{}, &permanentError{fmt.Errorf("fetch master: %w", err)}

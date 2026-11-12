@@ -110,9 +110,10 @@ func main() {
 		bucket:     bucket,
 		clearFiles: clearFiles,
 
-		allowedQualities: allowedQualities,
-		tailTolerance:    envInt("TAIL_SEGMENTS_TOLERANCE", 30),
-		workers:          workers,
+		allowedQualities:    allowedQualities,
+		tailTolerance:       envInt("TAIL_SEGMENTS_TOLERANCE", 30),
+		masterProxySwitches: envInt("SOURCE_MASTER_PROXY_SWITCHES", 3),
+		workers:             workers,
 
 		jobHeartbeatInterval: jobHeartbeatInterval,
 		jobRecoveryTimeout:   jobRecoveryTimeout,

@@ -279,6 +279,12 @@ func isSourceNotFound(err error) bool {
 	return errors.As(err, &se) && se.Status == http.StatusNotFound
 }
 
+// isSourceForbidden reports a 403 from the source.
+func isSourceForbidden(err error) bool {
+	var se *sourceStatusError
+	return errors.As(err, &se) && se.Status == http.StatusForbidden
+}
+
 // permanentError marks a failure that a retry cannot fix: the job is failed for good (attempts are used up).
 type permanentError struct{ err error }
 
