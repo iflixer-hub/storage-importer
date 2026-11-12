@@ -19,8 +19,14 @@ type throttledTransport struct {
 	maxRetries int           // retries after a 429
 	backoff    time.Duration // first wait after a 429 when the response has no Retry-After, doubles each retry
 
-	onRateLimited func(key string)                  // a 429 was received
-	onWait        func(key string, d time.Duration) // time spent waiting for a free slot
+	// The source answers 403 now and then for a file it serves a moment later (the same URL through the same proxy
+	// works when asked again), so a 403 is asked for again before it fails the job. 0 turns it off.
+	forbiddenRetries int
+	forbiddenBackoff time.Duration // wait before the first retry of a 403, doubles each retry
+
+	onRateLimited    func(key string)                  // a 429 was received
+	onForbiddenRetry func(key string)                  // a 403 is asked for again
+	onWait           func(key string, d time.Duration) // time spent waiting for a free slot
 
 	mu   sync.Mutex
 	next map[string]time.Time
@@ -29,7 +35,7 @@ type throttledTransport struct {
 const maxRateLimitWait = 60 * time.Second
 
 func newThrottledTransport(base http.RoundTripper, gap time.Duration, maxRetries int) *throttledTransport {
-	return &throttledTransport{base: base, gap: gap, maxRetries: maxRetries, backoff: 5 * time.Second, next: map[string]time.Time{}}
+	return &throttledTransport{base: base, gap: gap, maxRetries: maxRetries, backoff: 5 * time.Second, forbiddenBackoff: 2 * time.Second, next: map[string]time.Time{}}
 }
 
 func throttleKey(req *http.Request) string {
@@ -41,6 +47,7 @@ func throttleKey(req *http.Request) string {
 
 func (t *throttledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	key := throttleKey(req)
+	forbidden := 0
 	for attempt := 0; ; attempt++ {
 		waited, err := t.wait(req.Context(), key)
 		if t.onWait != nil && waited > 0 {
@@ -52,6 +59,24 @@ func (t *throttledTransport) RoundTrip(req *http.Request) (*http.Response, error
 		resp, err := t.base.RoundTrip(req)
 		if err == nil && resp.StatusCode == http.StatusTooManyRequests && t.onRateLimited != nil {
 			t.onRateLimited(key)
+		}
+		if err == nil && resp.StatusCode == http.StatusForbidden && forbidden < t.forbiddenRetries {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			resp.Body.Close()
+			pause := t.forbiddenBackoff << forbidden
+			forbidden++
+			if t.onForbiddenRetry != nil {
+				t.onForbiddenRetry(key)
+			}
+			timer := time.NewTimer(pause)
+			select {
+			case <-timer.C:
+			case <-req.Context().Done():
+				timer.Stop()
+				return nil, req.Context().Err()
+			}
+			attempt-- // the 429 budget is not spent by a 403
+			continue
 		}
 		if err != nil || resp.StatusCode != http.StatusTooManyRequests || attempt >= t.maxRetries {
 			return resp, err

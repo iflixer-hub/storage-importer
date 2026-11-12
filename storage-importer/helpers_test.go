@@ -255,3 +255,39 @@ func TestIsUnknownColumn(t *testing.T) {
 		t.Error("only 1054 counts")
 	}
 }
+
+func TestThrottleRetriesOn403(t *testing.T) {
+	f := &fakeRT{codes: []int{403, 403, 200}}
+	tr := newThrottledTransport(f, 0, 3)
+	tr.forbiddenRetries = 2
+	tr.forbiddenBackoff = 10 * time.Millisecond
+	retried := 0
+	tr.onForbiddenRetry = func(string) { retried++ }
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	resp, err := tr.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 || len(f.times) != 3 || retried != 2 {
+		t.Fatalf("resp=%v err=%v calls=%d retried=%d", resp, err, len(f.times), retried)
+	}
+	if gap := f.times[2].Sub(f.times[1]); gap < 18*time.Millisecond {
+		t.Errorf("the pause should double: %v", gap)
+	}
+
+	// a 403 that stays is handed back after the retries
+	f = &fakeRT{codes: []int{403, 403, 403, 403}}
+	tr = newThrottledTransport(f, 0, 3)
+	tr.forbiddenRetries = 2
+	tr.forbiddenBackoff = time.Millisecond
+	resp, _ = tr.RoundTrip(req)
+	if resp.StatusCode != 403 || len(f.times) != 3 {
+		t.Errorf("status=%d calls=%d, want 403 after 3 calls", resp.StatusCode, len(f.times))
+	}
+
+	// off by default in the transport itself
+	f = &fakeRT{codes: []int{403, 200}}
+	tr = newThrottledTransport(f, 0, 3)
+	tr.forbiddenRetries = 0
+	resp, _ = tr.RoundTrip(req)
+	if resp.StatusCode != 403 || len(f.times) != 1 {
+		t.Errorf("retries 0: status=%d calls=%d", resp.StatusCode, len(f.times))
+	}
+}
