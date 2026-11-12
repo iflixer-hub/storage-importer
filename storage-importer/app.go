@@ -341,6 +341,22 @@ SET status='failed', last_error=?, finished_at=NOW(), attempts=GREATEST(attempts
 	return requireCurrentLease(result, e)
 }
 
+// releaseJob gives a job back to the queue when the process is stopped: status new and the attempt of this run is not
+// counted. Without it the job stays in_progress and is failed as "worker lease expired" ten minutes later. It
+// uses its own context, because the one of the worker is already cancelled.
+func (a *App) releaseJob(job Job) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const q = `
+UPDATE files_storage
+SET status='new', attempts=GREATEST(attempts-1, 0), started_at=NULL, last_error=NULL
+	WHERE file_id=? AND status='in_progress' AND attempts=?`
+	started := logSQLStart("releaseJob", q, job.FileID, job.AttemptNumber)
+	result, err := a.db.ExecContext(ctx, q, job.FileID, job.AttemptNumber)
+	logSQLFinish("releaseJob", started, err)
+	return requireCurrentLease(result, err)
+}
+
 func (a *App) markDone(ctx context.Context, job Job, lastError string) error {
 	if strings.TrimSpace(lastError) == "" {
 		const q = `
@@ -449,15 +465,32 @@ func (a *App) fetchText(ctx context.Context, rawURL string) ([]byte, string, err
 	return b, resp.Request.URL.String(), nil
 }
 
+// sleepCtx waits for d or for the end of ctx.
+func sleepCtx(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
 func (a *App) worker(ctx context.Context, idx int) {
 	log.Printf("[w%d] worker started", idx)
 	lastIdleLog := time.Time{}
 
 	for {
+		if ctx.Err() != nil {
+			log.Printf("[w%d] worker stopped", idx)
+			return
+		}
 		job, ok, err := a.claimJob(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				continue
+			}
 			log.Printf("[w%d] claim error: %v", idx, err)
-			time.Sleep(2 * time.Second)
+			sleepCtx(ctx, 2*time.Second)
 			continue
 		}
 		if !ok {
@@ -465,7 +498,7 @@ func (a *App) worker(ctx context.Context, idx int) {
 				log.Printf("[w%d] idle: no jobs available", idx)
 				lastIdleLog = time.Now()
 			}
-			time.Sleep(1 * time.Second)
+			sleepCtx(ctx, 1*time.Second)
 			continue
 		}
 		lastIdleLog = time.Time{}
@@ -479,11 +512,24 @@ func (a *App) worker(ctx context.Context, idx int) {
 		result, processErr := a.processJob(jobCtx, job)
 		stopHeartbeat()
 		err = processErr
+		// the result of a finished job is saved even if the process is being stopped right now
+		finishCtx, finishCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		if err != nil && ctx.Err() != nil {
+			// the process is being stopped: the job is not failed, it goes back to the queue
+			a.metrics.inflightJobs.Dec()
+			if relErr := a.releaseJob(job); relErr != nil {
+				log.Printf("[w%d] job file_id=%d release on shutdown failed: %v", idx, job.FileID, relErr)
+			} else {
+				log.Printf("[w%d] job file_id=%d released to the queue on shutdown", idx, job.FileID)
+			}
+			finishCancel()
+			continue
+		}
 		if err != nil {
 			a.metrics.jobsTotal.WithLabelValues("failed").Inc()
 			a.metrics.jobDuration.WithLabelValues("failed").Observe(time.Since(start).Seconds())
 			log.Printf("[w%d] job file_id=%d FAILED: %v", idx, job.FileID, err)
-			if markErr := a.markFailed(ctx, job, err); markErr != nil {
+			if markErr := a.markFailed(finishCtx, job, err); markErr != nil {
 				log.Printf("[w%d] job file_id=%d mark failed skipped: %v", idx, job.FileID, markErr)
 			}
 		} else {
@@ -499,15 +545,16 @@ func (a *App) worker(ctx context.Context, idx int) {
 			} else {
 				log.Printf("[w%d] job file_id=%d DONE", idx, job.FileID)
 			}
-			markErr := a.markDone(ctx, job, result.partialMessage)
+			markErr := a.markDone(finishCtx, job, result.partialMessage)
 			if markErr != nil {
 				log.Printf("[w%d] job file_id=%d mark done skipped: %v", idx, job.FileID, markErr)
 			}
 			if markErr == nil && a.clearFiles {
-				_ = a.clearFilesPath(ctx, job.FileID)
+				_ = a.clearFilesPath(finishCtx, job.FileID)
 			}
 		}
 		a.metrics.inflightJobs.Dec()
+		finishCancel()
 	}
 }
 

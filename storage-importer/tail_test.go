@@ -5,6 +5,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInTailWindow(t *testing.T) {
@@ -79,4 +80,35 @@ func testutilCounter(c interface{ Write(*dto.Metric) error }) float64 {
 	m := &dto.Metric{}
 	_ = c.Write(m)
 	return m.GetCounter().GetValue()
+}
+
+func TestReleaseJobReturnsTheJobWithoutSpendingTheAttempt(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+
+	if err := f.app.releaseJob(Job{FileID: 11, AttemptNumber: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rec.execs) != 1 {
+		t.Fatalf("execs = %d", len(f.rec.execs))
+	}
+	q := compactSQL(f.rec.execs[0].query)
+	for _, want := range []string{"status='new'", "attempts=GREATEST(attempts-1, 0)", "status='in_progress' AND attempts=?"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("query lacks %q:\n%s", want, q)
+		}
+	}
+	if args := f.rec.execs[0].args; len(args) != 2 || args[0] != int64(11) || args[1] != int64(3) {
+		t.Errorf("args = %v", args)
+	}
+}
+
+func TestSleepCtxStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	sleepCtx(ctx, time.Minute)
+	if time.Since(start) > time.Second {
+		t.Error("a cancelled context must end the sleep at once")
+	}
 }

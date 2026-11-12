@@ -7,6 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -133,10 +136,25 @@ func main() {
 	log.Printf("source request headers: user-agent=%q referer=%q", sourceHeaders.Get("User-Agent"), sourceHeaders.Get("Referer"))
 	log.Printf("start: sourceDelayMs=%d source429Retries=%d allowedQualities=%v workers=%d clearFiles=%v bucket=%s endpoint=%s debugMySQL=%v mysqlLogErrors=%v", envInt("SOURCE_REQUEST_DELAY_MS", 0), envInt("SOURCE_429_RETRIES", 3), sortedQualities(allowedQualities), workers, clearFiles, bucket, endpoint, debugMySQL, mysqlLogErrors)
 
-	ctx := context.Background()
+	// SIGTERM (a deploy, a restart): the jobs in work go back to the queue instead of failing with "worker lease expired"
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	go app.recoveryLoop(ctx)
+	var wg sync.WaitGroup
 	for i := range workers {
-		go app.worker(ctx, i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			app.worker(ctx, i)
+		}(i)
 	}
-	select {}
+	<-ctx.Done()
+	log.Printf("shutdown: returning jobs in work to the queue")
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		log.Printf("shutdown: workers did not stop in 20s")
+	}
 }
