@@ -23,6 +23,8 @@ type throttledTransport struct {
 	// works when asked again), so a 403 is asked for again before it fails the job. 0 turns it off.
 	forbiddenRetries int
 	forbiddenBackoff time.Duration // wait before the first retry of a 403, doubles each retry
+	// the source refuses some user agents (403 for exactly that string): each retry of a 403 takes the next one
+	altUserAgents []string
 
 	onRateLimited    func(key string)                  // a 429 was received
 	onForbiddenRetry func(key string)                  // a 403 is asked for again
@@ -74,6 +76,10 @@ func (t *throttledTransport) RoundTrip(req *http.Request) (*http.Response, error
 			case <-req.Context().Done():
 				timer.Stop()
 				return nil, req.Context().Err()
+			}
+			if len(t.altUserAgents) > 0 {
+				ua := t.altUserAgents[(forbidden-1)%len(t.altUserAgents)]
+				req = withUserAgent(req, ua)
 			}
 			attempt-- // the 429 budget is not spent by a 403
 			continue

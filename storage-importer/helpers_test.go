@@ -190,7 +190,7 @@ func TestBrowserHeadersTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := capture.got.Header
-	if !strings.Contains(got.Get("User-Agent"), "Chrome/140") || strings.Contains(got.Get("User-Agent"), "Go-http-client") {
+	if !strings.Contains(got.Get("User-Agent"), "Chrome/157") || strings.Contains(got.Get("User-Agent"), "Go-http-client") {
 		t.Errorf("user agent = %q", got.Get("User-Agent"))
 	}
 	if got.Get("Referer") != "https://uakino.best/" || got.Get("Origin") != "https://uakino.best" {
@@ -291,3 +291,51 @@ func TestThrottleRetriesOn403(t *testing.T) {
 		t.Errorf("retries 0: status=%d calls=%d", resp.StatusCode, len(f.times))
 	}
 }
+
+func TestChromeClientHintsFollowTheUserAgent(t *testing.T) {
+	h := browserHeaders(defaultSourceUserAgent, "", defaultSourceLanguage)
+	if !strings.Contains(h.Get("Sec-CH-UA"), `v="157"`) {
+		t.Errorf("Sec-CH-UA = %q", h.Get("Sec-CH-UA"))
+	}
+	if browserHeaders("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0", "", "uk").Get("Sec-CH-UA") != "" {
+		t.Error("Firefox sends no client hints")
+	}
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	req.Header = browserHeaders(defaultSourceUserAgent, "", "uk")
+	ff := withUserAgent(req, defaultAlternativeUserAgents[1])
+	if ff.Header.Get("Sec-CH-UA") != "" || !strings.Contains(ff.Header.Get("User-Agent"), "Firefox") {
+		t.Errorf("hints must go with the old user agent: %v", ff.Header)
+	}
+	if !strings.Contains(req.Header.Get("User-Agent"), "Chrome/157") {
+		t.Error("the original request must not change")
+	}
+}
+
+func TestForbiddenRetryRotatesUserAgent(t *testing.T) {
+	var seen []string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seen = append(seen, r.Header.Get("User-Agent"))
+		code := 403
+		if strings.Contains(r.Header.Get("User-Agent"), "Firefox") {
+			code = 200
+		}
+		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}, Request: r}, nil
+	})
+	tr := newThrottledTransport(rt, 0, 3)
+	tr.forbiddenRetries = 3
+	tr.forbiddenBackoff = time.Millisecond
+	tr.altUserAgents = []string{"Mozilla/5.0 Chrome-other", "Mozilla/5.0 Firefox/132"}
+	req, _ := http.NewRequest("GET", "http://x/", nil)
+	req.Header.Set("User-Agent", "first")
+	resp, err := tr.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("resp=%v err=%v", resp, err)
+	}
+	if len(seen) != 3 || seen[0] != "first" || seen[1] != "Mozilla/5.0 Chrome-other" || seen[2] != "Mozilla/5.0 Firefox/132" {
+		t.Errorf("user agents tried: %v", seen)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

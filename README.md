@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS importer_proxy_leases (
 # Заголовки запросов к источнику
 
 Источник отвечает `403` на запросы с `User-Agent: Go-http-client` (проверено через прокси: с браузерным `User-Agent` `200`, с Go `403`), поэтому каждый запрос к нему идёт с заголовками браузера (тот же профиль Chrome 140, что в flixhub-mono): `User-Agent`, `Accept`, `Accept-Language`, `Referer`, `Origin`, `Sec-Fetch-*`, `Sec-CH-UA*`. `Accept-Encoding` не задаётся: Go сам просит gzip и сам его распаковывает.
-- `SOURCE_USER_AGENT` - `User-Agent` (по умолчанию Chrome 140 на Windows; `Sec-CH-UA*` добавляются только для него)
+- `SOURCE_USER_AGENT` - `User-Agent` (по умолчанию Chrome 157 на Windows; `Sec-CH-UA*` добавляются для любого Chrome на Windows и совпадают с его версией). Источник (ashdi) отвечал 403 именно на строку `Chrome/140.0.0.0` (Chrome 131 и 157, Firefox, Safari, curl проходили), поэтому строку нельзя считать вечной
+- `SOURCE_USER_AGENT_ALT` - запасные `User-Agent` через `|` (по умолчанию Chrome 131, Firefox 132, Safari 17.6). Каждый повтор 403 (`SOURCE_403_RETRIES`) берёт следующий из списка, с подходящими `Sec-CH-UA*` (у Firefox и Safari их нет), так что отказ по строке UA лечится повтором, а не падением задачи. Для трёх запасных нужно `SOURCE_403_RETRIES` не меньше 3
 - `SOURCE_REFERER` - страница-источник запроса (по умолчанию `https://uakino.best/`), из неё же берётся `Origin`
 - `SOURCE_ACCEPT_LANGUAGE` - по умолчанию `uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7`
 

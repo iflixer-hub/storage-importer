@@ -124,6 +124,7 @@ func main() {
 	app.metrics = metrics
 	throttle.onRateLimited = func(proxy string) { metrics.sourceRateLimited.WithLabelValues(proxy).Inc() }
 	throttle.forbiddenRetries = envInt("SOURCE_403_RETRIES", 2)
+	throttle.altUserAgents = alternativeUserAgentsFromEnv()
 	throttle.onForbiddenRetry = func(proxy string) { metrics.sourceForbiddenRetries.WithLabelValues(proxy).Inc() }
 	throttle.onWait = func(proxy string, d time.Duration) {
 		metrics.sourceThrottleWait.WithLabelValues(proxy).Add(d.Seconds())
