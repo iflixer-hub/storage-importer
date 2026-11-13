@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -283,6 +285,28 @@ func isSourceNotFound(err error) bool {
 func isSourceForbidden(err error) bool {
 	var se *sourceStatusError
 	return errors.As(err, &se) && se.Status == http.StatusForbidden
+}
+
+// isProxyFailure reports an error that the proxy rather than the source caused, or that another proxy may not
+// have: the source refused this address (403), the proxy refused or could not pass the request (407, 5xx of the
+// proxy), the connection failed or timed out.
+func isProxyFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *sourceStatusError
+	if errors.As(err, &se) {
+		switch se.Status {
+		case http.StatusForbidden, http.StatusProxyAuthRequired, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		}
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // permanentError marks a failure that a retry cannot fix: the job is failed for good (attempts are used up).

@@ -766,17 +766,17 @@ func (a *App) processJob(ctx context.Context, j Job) (processResult, error) {
 	log.Printf("[job %d] source proxy=%s", j.FileID, proxyEndpoint(proxy))
 	log.Printf("[job %d] fetch master %s", j.FileID, j.SourceMaster)
 	masterBytes, masterURL, err := a.fetchText(ctx, j.SourceMaster)
-	// The source refuses some proxies for a while (403 stays after the retries of the transport): the job takes
-	// another proxy instead of failing, and the refused one is passed over by the next jobs.
+	// The source refuses some proxies for a while (403 stays after the retries of the transport), and some proxies are
+	// dead or hang: the job takes another proxy instead of failing, and the bad one is passed over by the next jobs.
 	var failedProxies []string
-	for switches := 0; err != nil && isSourceForbidden(err) && proxy != nil && switches < a.masterProxySwitches && baseCtx.Err() == nil; switches++ {
+	for switches := 0; err != nil && isProxyFailure(err) && proxy != nil && switches < a.masterProxySwitches && baseCtx.Err() == nil; switches++ {
 		a.proxies.penalize(proxy)
 		failedProxies = append(failedProxies, proxy.Host)
 		a.metrics.proxySwitches.WithLabelValues(proxyEndpoint(proxy)).Inc()
 		releaseProxy()
 		proxy, releaseProxy = a.proxies.acquire(baseCtx, owner, failedProxies...)
 		ctx = withSourceProxy(baseCtx, proxy)
-		log.Printf("[job %d] master refused (403) via %s, trying proxy=%s", j.FileID, failedProxies[len(failedProxies)-1], proxyEndpoint(proxy))
+		log.Printf("[job %d] master failed via %s (%s), trying proxy=%s", j.FileID, failedProxies[len(failedProxies)-1], shortErr(err), proxyEndpoint(proxy))
 		masterBytes, masterURL, err = a.fetchText(ctx, j.SourceMaster)
 	}
 	if err != nil {
@@ -1018,7 +1018,18 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 	if err != nil {
 		return processResult{}, fmt.Errorf("parse as media: %w", err)
 	}
-	quality := "default"
+	// The source gave the playlist of one quality instead of a master. Its quality is in the address (.../hls/720/...);
+	// with ALLOWED_QUALITIES only a listed quality is imported, and nothing is ever put into a folder that is not a
+	// quality ("default" was one).
+	quality := guessQualityFromURIOrInf(baseURL, "")
+	if quality == "" {
+		quality = "default"
+	}
+	if len(a.allowedQualities) > 0 && !qualityAllowed(a.allowedQualities, quality, "") {
+		a.metrics.qualitiesTotal.WithLabelValues("skipped").Inc()
+		return processResult{}, &permanentError{fmt.Errorf("the source gave a single playlist of quality=%q, which is not in ALLOWED_QUALITIES (%s): %s",
+			quality, strings.Join(sortedQualities(a.allowedQualities), ","), baseURL)}
+	}
 	var have map[string]bool
 	if ok, names, err := a.verifyQualityInStorage(ctx, j, quality); err != nil {
 		log.Printf("[job %d] cannot verify quality=%s in the storage: %v", j.FileID, quality, err)
@@ -1052,7 +1063,7 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		return processResult{}, err
 	}
 
-	// master, который просто ссылается на default/index.m3u8
+	// master, который просто ссылается на <quality>/index.m3u8
 	masterOut := "#EXTM3U\n" +
 		"#EXT-X-STREAM-INF:BANDWIDTH=1\n" +
 		quality + "/index.m3u8\n"
@@ -1069,4 +1080,9 @@ func (a *App) processSinglePlaylistAsQuality(ctx context.Context, j Job, baseURL
 		log.Printf("[job %d] save qualities_json failed: %v", j.FileID, err)
 	}
 	return processResult{}, nil
+}
+
+// shortErr is an error cut for a log line.
+func shortErr(err error) string {
+	return truncate(err.Error(), 160)
 }

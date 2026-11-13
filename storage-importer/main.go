@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -73,6 +74,10 @@ func main() {
 		MaxIdleConnsPerHost: 200,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  false,
+		// a dead or hanging proxy is noticed in seconds, not after the 120 s of the whole request
+		DialContext:           (&net.Dialer{Timeout: time.Duration(envInt("SOURCE_DIAL_TIMEOUT_SECONDS", 15)) * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   time.Duration(envInt("SOURCE_DIAL_TIMEOUT_SECONDS", 15)) * time.Second,
+		ResponseHeaderTimeout: time.Duration(envInt("SOURCE_HEADER_TIMEOUT_SECONDS", 30)) * time.Second,
 	}
 	throttle := newThrottledTransport(
 		sourceTransport,

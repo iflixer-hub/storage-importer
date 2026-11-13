@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	dto "github.com/prometheus/client_model/go"
 	"io"
@@ -228,5 +230,108 @@ func TestRetryOnDeadlock(t *testing.T) {
 	other := io.EOF
 	if err := retryOnDeadlock(context.Background(), func() error { calls++; return other }); err != other || calls != 1 {
 		t.Fatalf("other errors are not retried: err=%v calls=%d", err, calls)
+	}
+}
+
+func TestSinglePlaylistOfAnUnlistedQualityIsNotImported(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+	f.app.allowedQualities = parseQualityList("480,720")
+
+	_, err := f.app.processJob(context.Background(), Job{FileID: 8, SourceMaster: f.srcURL + "/m/hls/1080/ABC==/i.m3u8", R2Prefix: "files/8", R2MasterKey: "files/8/index.m3u8"})
+	if err == nil || !isPermanentError(err) || !strings.Contains(err.Error(), "quality=\"1080\"") {
+		t.Fatalf("a single 1080 playlist must be refused: %v", err)
+	}
+	if f.hit("/m/hls/1080/ABC==/segment1.ts") {
+		t.Error("no chunk of an unlisted quality is downloaded")
+	}
+}
+
+func TestSinglePlaylistOfAListedQualityGoesToItsFolder(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+	f.app.allowedQualities = parseQualityList("480,720")
+
+	if _, err := f.app.processJob(context.Background(), Job{FileID: 9, SourceMaster: f.srcURL + "/m/hls/720/ABC==/i.m3u8", R2Prefix: "files/9", R2MasterKey: "files/9/index.m3u8"}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.hit("/m/hls/720/ABC==/segment1.ts") {
+		t.Error("the chunks of the listed quality are downloaded")
+	}
+	var saved bool
+	for _, e := range f.rec.execs {
+		for _, a := range e.args {
+			if s, ok := a.(string); ok && strings.Contains(s, "720/index.m3u8") {
+				saved = true
+			}
+			if s, ok := a.(string); ok && strings.Contains(s, "default") {
+				t.Errorf("nothing may be saved as default: %q", s)
+			}
+		}
+	}
+	if !saved {
+		t.Error("qualities_json must name the 720 folder")
+	}
+}
+
+func TestSinglePlaylistWithoutAllowListKeepsDefault(t *testing.T) {
+	if got := guessQualityFromURIOrInf("https://x/y/index.m3u8", ""); got != "" {
+		t.Fatalf("an address without a quality gives no label, got %q", got)
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+func TestIsProxyFailure(t *testing.T) {
+	yes := []error{
+		&sourceStatusError{Status: 403}, &sourceStatusError{Status: 407}, &sourceStatusError{Status: 502},
+		timeoutErr{}, context.DeadlineExceeded, io.EOF, fmt.Errorf("Get x: %w", context.DeadlineExceeded),
+	}
+	no := []error{nil, &sourceStatusError{Status: 404}, &sourceStatusError{Status: 500}, &sourceStatusError{Status: 429}, errors.New("parse master")}
+	for _, e := range yes {
+		if !isProxyFailure(e) {
+			t.Errorf("%v must switch the proxy", e)
+		}
+	}
+	for _, e := range no {
+		if isProxyFailure(e) {
+			t.Errorf("%v must not switch the proxy", e)
+		}
+	}
+}
+
+func TestMasterTimeoutSwitchesToAnotherProxy(t *testing.T) {
+	f := newGoneFixture(t, func(string) bool { return false })
+	defer f.stop()
+	base := f.app.httpClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	var used []string
+	f.app.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		host := ""
+		if u, ok := r.Context().Value(proxyCtxKey{}).(*url.URL); ok && u != nil {
+			host = u.Host
+		}
+		if strings.HasSuffix(r.URL.Path, "master.m3u8") {
+			used = append(used, host)
+			if host == "dead.example:1" {
+				return nil, timeoutErr{}
+			}
+		}
+		return base.RoundTrip(r)
+	})}
+	f.app.masterProxySwitches = 3
+	f.app.proxies.list = []*url.URL{{Scheme: "http", Host: "dead.example:1"}, {Scheme: "http", Host: "ok.example:1"}}
+
+	if _, err := f.app.processJob(context.Background(), Job{FileID: 12, SourceMaster: f.srcURL + "/m/master.m3u8", R2Prefix: "files/12", R2MasterKey: "files/12/index.m3u8"}); err != nil {
+		t.Fatalf("a dead proxy must not fail the job: %v", err)
+	}
+	if len(used) != 2 || used[1] != "ok.example:1" {
+		t.Errorf("proxies tried: %v", used)
 	}
 }
